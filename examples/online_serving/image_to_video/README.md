@@ -1,6 +1,15 @@
 # Image-To-Video
 
-This example demonstrates how to deploy the Wan2.2 image-to-video model for online video generation using vLLM-Omni.
+This example demonstrates how to deploy image-to-video models for online
+video generation using vLLM-Omni.
+
+## Supported Models
+
+| Model | Model ID |
+|-------|----------|
+| Wan2.2 I2V | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` |
+| SANA-Video 2B (480p) | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` |
+| SANA-Video 2B (720p) | `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` |
 
 ## Start Server
 
@@ -28,7 +37,9 @@ The script allows overriding:
 
 ### SANA-Video-2B
 
-The native SANA I2V pipeline supports both released checkpoints:
+The released checkpoint indexes identify the T2V pipeline, so I2V serving
+must explicitly select `SanaImageToVideoPipeline`. The native SANA I2V
+pipeline supports both released checkpoints:
 
 ```bash
 # 480p
@@ -42,6 +53,10 @@ INPUT_IMAGE=/path/to/input.jpg \
 For native 720p I2V, start the server with
 `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` and call the client with
 `WIDTH=1280 HEIGHT=704` in addition to `INPUT_IMAGE`.
+
+Both checkpoints use 81 frames at 16 FPS as their standard generation
+profile. The client passes `motion_score` through `extra_params` and supports
+overriding `WIDTH`, `HEIGHT`, and `OUTPUT_PATH`.
 
 The Diffusers-adapter compatibility path is validated at both resolutions:
 
@@ -67,6 +82,14 @@ Native 480p uses the
 `DistributedAutoencoderKLLTX2Video`. These wrappers retain the corresponding
 Diffusers autoencoder implementations, and the native SANA denoising loop
 intentionally retains Diffusers' `DPMSolverMultistepScheduler`.
+
+The adapter server helper selects `TORCH_SDPA` because the SANA-Video
+attention mask is not accepted by the AITER-backed Diffusers attention path.
+Requests use the same `/v1/videos` API as the native pipeline.
+
+For architecture details, measured memory usage, offline commands, and the
+full T2V/I2V support matrix, see the
+[SANA-Video 2B recipe](../../../recipes/NVIDIA/SANA-Video-2B.md).
 
 ### Ascend / Local LightX2V Example
 

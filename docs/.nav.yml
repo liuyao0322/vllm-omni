@@ -39,7 +39,6 @@ nav:
       - MiMo-Audio: user_guide/examples/online_serving/mimo_audio.md
       - Qwen2.5-Omni: user_guide/examples/online_serving/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/online_serving/qwen3_omni.md
-      - SANA-Video 2B: user_guide/examples/online_serving/sana_video.md
       - Text-To-Speech: user_guide/examples/online_serving/text_to_speech.md
       - Text-To-Image: user_guide/examples/online_serving/text_to_image.md
       - Text-To-Video: user_guide/examples/online_serving/text_to_video.md
