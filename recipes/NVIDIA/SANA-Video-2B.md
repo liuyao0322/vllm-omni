@@ -165,14 +165,7 @@ r_frame_rate=16/1
 nb_frames=81
 ```
 
-For 480p, expect `width=832` and `height=480`. To validate the documented
-arguments and SANA-specific example wiring without loading the full model,
-run:
-
-```bash
-.venv/bin/python -m pytest -q \
-  tests/examples/offline_inference/test_sana_video_documented_commands.py
-```
+For 480p, expect `width=832` and `height=480`.
 
 The automated serving matrix covers both checkpoint variants:
 
