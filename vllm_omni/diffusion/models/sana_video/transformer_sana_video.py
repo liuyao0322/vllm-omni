@@ -672,13 +672,6 @@ class SanaCrossAttention(nn.Module):
         key = key.unflatten(2, (self.heads, self.head_dim))
         value = value.unflatten(2, (self.heads, self.head_dim))
 
-        if attention_mask is not None:
-            if attention_mask.ndim == 2:
-                attention_mask = (1 - attention_mask.to(query.dtype)) * -10000.0
-                attention_mask = attention_mask[:, None, None, :]
-            elif attention_mask.ndim == 3:
-                attention_mask = attention_mask[:, None, :, :]
-
         attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
         hidden_states = self.attn(query, key, value, attn_metadata)
         hidden_states = hidden_states.flatten(2, 3)
@@ -970,7 +963,7 @@ class SanaVideoTransformer3DModel(nn.Module):
             encoder_attention_mask (`torch.Tensor`, *optional*):
                 Cross-attention mask applied to `encoder_hidden_states`.
             attention_mask (`torch.Tensor`, *optional*):
-                Self-attention mask applied to `hidden_states`.
+                Retained for Diffusers API compatibility. SANA linear self-attention does not consume this mask.
             controlnet_block_samples (`tuple` of `torch.Tensor`, *optional*):
                 A list of tensors that if specified are added to the residuals of transformer blocks.
             return_dict (`bool`, *optional*, defaults to `True`):
@@ -980,28 +973,29 @@ class SanaVideoTransformer3DModel(nn.Module):
             If `return_dict` is True, a [`SanaVideoTransformerOutput`] is returned, otherwise a
             `tuple` where the first element is the sample tensor.
         """
-        # ensure attention_mask is a bias, and give it a singleton query_tokens dimension.
-        #   we may have done this conversion already, e.g. if we came here via UNet2DConditionModel#forward.
-        #   we can tell by counting dims; if ndim == 2: it's a mask rather than a bias.
-        # expects mask of shape:
-        #   [batch, key_tokens]
-        # adds singleton query_tokens dimension:
-        #   [batch,                    1, key_tokens]
-        # this helps to broadcast it as a bias over attention scores, which will be in one of the following shapes:
-        #   [batch,  heads, query_tokens, key_tokens] (e.g. torch sdp attn)
-        #   [batch * heads, query_tokens, key_tokens] (e.g. xformers or classic attn)
-        if attention_mask is not None and attention_mask.ndim == 2:
-            # assume that mask is expressed as:
-            #   (1 = keep,      0 = discard)
-            # convert mask into a bias that can be added to attention scores:
-            #       (keep = +0,     discard = -10000.0)
-            attention_mask = (1 - attention_mask.to(hidden_states.dtype)) * -10000.0
-            attention_mask = attention_mask.unsqueeze(1)
-
-        # convert encoder_attention_mask to a bias the same way we do for attention_mask
-        if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
-            encoder_attention_mask = (1 - encoder_attention_mask.to(hidden_states.dtype)) * -10000.0
-            encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
+        # SANA's linear self-attention does not consume ``attention_mask``;
+        # retain the public argument for Diffusers-compatible call sites.
+        if encoder_attention_mask is not None:
+            if encoder_attention_mask.ndim != 2:
+                raise ValueError(
+                    "encoder_attention_mask must be a 2D padding mask with "
+                    f"shape (batch_size, key_length); got {tuple(encoder_attention_mask.shape)}"
+                )
+            if encoder_attention_mask.shape != encoder_hidden_states.shape[:2]:
+                raise ValueError(
+                    "encoder_attention_mask shape must match encoder_hidden_states: "
+                    f"expected {tuple(encoder_hidden_states.shape[:2])}, "
+                    f"got {tuple(encoder_attention_mask.shape)}"
+                )
+            if encoder_attention_mask.is_floating_point() or encoder_attention_mask.is_complex():
+                raise TypeError(
+                    "encoder_attention_mask must be a boolean or integer padding mask, "
+                    "not a floating-point additive attention bias"
+                )
+            encoder_attention_mask = encoder_attention_mask.to(
+                device=encoder_hidden_states.device,
+                dtype=torch.bool,
+            )
 
         # 1. Input
         batch_size, num_channels, num_frames, height, width = hidden_states.shape

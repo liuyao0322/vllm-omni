@@ -374,6 +374,66 @@ def test_tiny_transformer_matches_diffusers_and_frozen_output():
     torch.testing.assert_close(actual.flatten()[: len(_GOLDEN_PREFIX)], _GOLDEN_PREFIX, rtol=1e-5, atol=1e-5)
 
 
+def test_encoder_attention_mask_uses_omni_padding_mask_contract(monkeypatch):
+    from vllm_omni.diffusion.models.sana_video import SanaVideoTransformer3DModel
+
+    torch.manual_seed(37)
+    model = SanaVideoTransformer3DModel(**_TINY_CONFIG).eval()
+    captured = {}
+
+    def fake_attention_forward(query, key, value, attn_metadata):
+        captured["query_shape"] = query.shape
+        captured["key_shape"] = key.shape
+        captured["metadata"] = attn_metadata
+        captured["mask"] = attn_metadata.attn_mask.detach().clone()
+        return torch.zeros_like(query)
+
+    cross_attention = model.transformer_blocks[0].attn2.attn
+    monkeypatch.setattr(cross_attention, "forward", fake_attention_forward)
+
+    hidden_states = torch.randn(2, 4, 3, 4, 4)
+    encoder_hidden_states = torch.randn(2, 5, 8)
+    input_mask = torch.tensor(
+        [
+            [1, 1, 1, 0, 0],
+            [1, 1, 1, 1, 0],
+        ],
+        dtype=torch.int64,
+    )
+
+    with torch.no_grad():
+        output = model(
+            hidden_states,
+            encoder_hidden_states,
+            torch.tensor([100.0, 500.0]),
+            encoder_attention_mask=input_mask,
+        ).sample
+
+    assert output.shape == hidden_states.shape
+    assert captured["query_shape"][:2] == (2, 12)
+    assert captured["key_shape"][:2] == (2, 5)
+    assert captured["query_shape"][1] != captured["key_shape"][1]
+    assert captured["metadata"] is not None
+    assert captured["mask"].shape == (2, 5)
+    assert captured["mask"].dtype == torch.bool
+    assert torch.equal(captured["mask"], input_mask.bool())
+
+
+def test_encoder_attention_mask_rejects_additive_bias():
+    from vllm_omni.diffusion.models.sana_video import SanaVideoTransformer3DModel
+
+    model = SanaVideoTransformer3DModel(**_TINY_CONFIG).eval()
+    additive_mask = torch.tensor([[0.0, 0.0, 0.0, -10000.0, -10000.0]])
+
+    with pytest.raises(TypeError, match="not a floating-point additive attention bias"):
+        model(
+            torch.randn(1, 4, 3, 4, 4),
+            torch.randn(1, 5, 8),
+            torch.tensor([500.0]),
+            encoder_attention_mask=additive_mask,
+        )
+
+
 def test_linear_attention_requires_rotary_embeddings():
     from vllm_omni.diffusion.models.sana_video.transformer_sana_video import SanaLinearAttention
 

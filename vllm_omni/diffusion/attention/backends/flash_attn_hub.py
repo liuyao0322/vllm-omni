@@ -106,12 +106,17 @@ class FlashAttentionHubImpl(AttentionImpl):
         prefix: str = "",
         qkv_layout: str | None = None,
         backend_kwargs: dict | None = None,
+        role: str = "self",
+        role_category: str | None = None,
         **extra_impl_args,
     ) -> None:
         self.num_heads = num_heads
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.qkv_layout = qkv_layout
+        self.role = role
+        self.role_category = role_category
+        self.is_cross_attention = role == "cross" or role_category == "cross"
         if backend_kwargs:
             logger.warning("FlashAttentionHubImpl ignoring backend_kwargs: %s", list(backend_kwargs.keys()))
 
@@ -148,14 +153,20 @@ class FlashAttentionHubImpl(AttentionImpl):
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             _pad_input,
             _unpad_input,
+            _upad_cross_attention_input,
             _upad_input,
         )
 
-        assert attention_mask.ndim == 2, "attention_mask must be 2D, (batch_size, seq_len)"
         query_length = query.size(1)
-        q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_input(
-            query, key, value, attention_mask, query_length, _unpad_input
-        )
+        if self.is_cross_attention:
+            q, k, v, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_cross_attention_input(
+                query, key, value, attention_mask
+            )
+            indices_q = None
+        else:
+            q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_input(
+                query, key, value, attention_mask, query_length, _unpad_input
+            )
 
         out_unpad = self.flash_attn_varlen_func(
             q,
@@ -171,6 +182,8 @@ class FlashAttentionHubImpl(AttentionImpl):
             },
         )
         out_unpad = self._unwrap_flash_output(out_unpad)
+        if indices_q is None:
+            return out_unpad.reshape(query.size(0), query_length, *out_unpad.shape[1:])
         return _pad_input(out_unpad, indices_q, query.size(0), query_length)
 
     def _forward_varlen_dense(
@@ -216,13 +229,18 @@ class FlashAttentionHubImpl(AttentionImpl):
                 query_ranges=attn_metadata.query_ranges,
             )
 
-        if attention_mask is not None and torch.any(~attention_mask):
-            return self._forward_varlen_masked(
-                query,
-                key,
-                value,
-                attention_mask,
+        if attention_mask is not None:
+            from vllm_omni.diffusion.attention.backends.utils.fa import (
+                _validate_padding_mask,
             )
+
+            if _validate_padding_mask(attention_mask, key):
+                return self._forward_varlen_masked(
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                )
 
         if self.flash_attn_func is not None:
             out = self.flash_attn_func(
@@ -273,12 +291,17 @@ class FlashAttention3HubImpl(AttentionImpl):
         prefix: str = "",
         qkv_layout: str | None = None,
         backend_kwargs: dict | None = None,
+        role: str = "self",
+        role_category: str | None = None,
         **extra_impl_args,
     ) -> None:
         self.num_heads = num_heads
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.qkv_layout = qkv_layout
+        self.role = role
+        self.role_category = role_category
+        self.is_cross_attention = role == "cross" or role_category == "cross"
         if backend_kwargs:
             logger.warning("FlashAttention3HubImpl ignoring backend_kwargs: %s", list(backend_kwargs.keys()))
 
@@ -315,14 +338,20 @@ class FlashAttention3HubImpl(AttentionImpl):
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             _pad_input,
             _unpad_input,
+            _upad_cross_attention_input,
             _upad_input,
         )
 
-        assert attention_mask.ndim == 2, "attention_mask must be 2D, (batch_size, seq_len)"
         query_length = query.size(1)
-        q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_input(
-            query, key, value, attention_mask, query_length, _unpad_input
-        )
+        if self.is_cross_attention:
+            q, k, v, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_cross_attention_input(
+                query, key, value, attention_mask
+            )
+            indices_q = None
+        else:
+            q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_input(
+                query, key, value, attention_mask, query_length, _unpad_input
+            )
 
         out_unpad = self.flash_attn_varlen_func(
             q,
@@ -338,6 +367,8 @@ class FlashAttention3HubImpl(AttentionImpl):
             },
         )
         out_unpad = self._unwrap_flash_output(out_unpad)
+        if indices_q is None:
+            return out_unpad.reshape(query.size(0), query_length, *out_unpad.shape[1:])
         return _pad_input(out_unpad, indices_q, query.size(0), query_length)
 
     def _forward_varlen_dense(
@@ -383,13 +414,18 @@ class FlashAttention3HubImpl(AttentionImpl):
                 query_ranges=attn_metadata.query_ranges,
             )
 
-        if attention_mask is not None and torch.any(~attention_mask):
-            return self._forward_varlen_masked(
-                query,
-                key,
-                value,
-                attention_mask,
+        if attention_mask is not None:
+            from vllm_omni.diffusion.attention.backends.utils.fa import (
+                _validate_padding_mask,
             )
+
+            if _validate_padding_mask(attention_mask, key):
+                return self._forward_varlen_masked(
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                )
 
         if self.flash_attn_func is not None:
             out = self.flash_attn_func(

@@ -102,3 +102,60 @@ def test_kernels_hub_execution():
     assert not torch.isnan(output_fa3_hub).any()
     max_diff = torch.max(torch.abs(output_ref - output_fa3_hub)).item()
     assert max_diff < 1e-2, f"FlashAttention3Hub output differs too much from SDPA reference: {max_diff}"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("impl_name", "tuple_output"),
+    [
+        ("FlashAttentionHubImpl", False),
+        ("FlashAttention3HubImpl", True),
+    ],
+)
+def test_kernels_hub_masked_cross_attention_unpads_only_kv(monkeypatch, impl_name, tuple_output):
+    from vllm_omni.diffusion.attention.backends import flash_attn_hub
+
+    calls = []
+
+    def fake_varlen_func(q, k, v, **kwargs):
+        calls.append((q.detach().clone(), k.detach().clone(), v.detach().clone(), kwargs))
+        return (q, torch.empty(0)) if tuple_output else q
+
+    fake_module = types.SimpleNamespace(
+        flash_attn_func=None,
+        flash_attn_varlen_func=fake_varlen_func,
+    )
+    monkeypatch.setattr(flash_attn_hub, "_get_hub_module", lambda repo_id: fake_module)
+    impl_cls = getattr(flash_attn_hub, impl_name)
+    impl = impl_cls(
+        num_heads=2,
+        head_size=4,
+        softmax_scale=0.5,
+        causal=False,
+        role_category="cross",
+    )
+
+    query = torch.arange(2 * 7 * 2 * 4, dtype=torch.float32).reshape(2, 7, 2, 4)
+    key = torch.arange(2 * 5 * 2 * 4, dtype=torch.float32).reshape(2, 5, 2, 4)
+    value = key + 1000
+    mask = torch.tensor(
+        [
+            [True, True, True, False, False],
+            [True, True, True, True, False],
+        ]
+    )
+
+    output = impl.forward_cuda(query, key, value, AttentionMetadata(attn_mask=mask))
+
+    assert len(calls) == 1
+    q_unpadded, k_unpadded, v_unpadded, kwargs = calls[0]
+    assert torch.equal(q_unpadded, query.flatten(0, 1))
+    assert torch.equal(k_unpadded, key.flatten(0, 1)[mask.flatten()])
+    assert torch.equal(v_unpadded, value.flatten(0, 1)[mask.flatten()])
+    assert torch.equal(kwargs["cu_seqlens_q"], torch.tensor([0, 7, 14], dtype=torch.int32))
+    assert torch.equal(kwargs["cu_seqlens_k"], torch.tensor([0, 3, 7], dtype=torch.int32))
+    assert kwargs["max_seqlen_q"] == 7
+    assert kwargs["max_seqlen_k"] == 4
+    assert output.shape == query.shape
+    assert torch.equal(output, query)
