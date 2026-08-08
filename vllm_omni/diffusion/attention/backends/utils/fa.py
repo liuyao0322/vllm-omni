@@ -240,7 +240,7 @@ def _get_unpad_data(attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.T
 
     Arguments:
         attention_mask (`torch.Tensor`):
-            Boolean tensor of shape (batch_size, sequence_length), where True means valid.
+            Boolean or int tensor of shape (batch_size, sequence_length), 1 means valid and 0 means not valid.
 
     Return:
         indices (`torch.Tensor`):
@@ -251,85 +251,16 @@ def _get_unpad_data(attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.T
         max_seqlen_in_batch (`int`):
             Maximum sequence length in batch.
     """
-    if torch.compiler.is_compiling():
-        # Keep the scalar max sequence length in the compiled graph.
-        torch._dynamo.config.capture_scalar_outputs = True
-
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
     indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
-    # FlashAttention kernels take the maximum sequence length as a scalar.
+    # NOTE: Similar to the `.item()` in prepare_fa2_from_position_ids, with torch compile,
+    # this might cause a graph break
     max_seqlen_in_batch = seqlens_in_batch.max().item()
     cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
     return (
         indices,
         cu_seqlens,
         max_seqlen_in_batch,
-    )
-
-
-def _validate_padding_mask(attention_mask: torch.Tensor, key_layer: torch.Tensor) -> bool:
-    """Validate a key-padding mask and report whether it contains padding."""
-    if attention_mask.dtype != torch.bool:
-        raise TypeError(f"FlashAttention padding masks must have dtype torch.bool; got {attention_mask.dtype}")
-    if attention_mask.ndim != 2:
-        raise ValueError(
-            "FlashAttention padding masks must be 2D with shape "
-            f"(batch_size, key_length); got {tuple(attention_mask.shape)}"
-        )
-
-    expected_shape = key_layer.shape[:2]
-    if attention_mask.shape != expected_shape:
-        raise ValueError(
-            "FlashAttention padding mask shape must match the key sequence: "
-            f"expected {tuple(expected_shape)}, got {tuple(attention_mask.shape)}"
-        )
-    if attention_mask.device != key_layer.device:
-        raise ValueError(
-            "FlashAttention padding mask and key tensor must be on the same device: "
-            f"got {attention_mask.device} and {key_layer.device}"
-        )
-
-    if torch.compiler.is_compiling():
-        torch._dynamo.config.capture_scalar_outputs = True
-    min_valid_keys = attention_mask.sum(dim=-1, dtype=torch.int32).min().item()
-    if min_valid_keys == 0:
-        raise ValueError("FlashAttention padding masks must keep at least one key per batch item")
-    return min_valid_keys < key_layer.shape[1]
-
-
-def _upad_cross_attention_input(
-    query_layer: torch.Tensor,
-    key_layer: torch.Tensor,
-    value_layer: torch.Tensor,
-    key_padding_mask: torch.Tensor,
-):
-    """Unpad cross-attention K/V while keeping every query token.
-
-    ``key_padding_mask`` describes only the key/value sequence. Cross-attention
-    queries are a separate, fully valid sequence and therefore must not reuse
-    the K/V indices used by the self-attention-oriented ``_upad_input`` helper.
-    """
-    if query_layer.shape[0] != key_layer.shape[0] or key_layer.shape[:2] != value_layer.shape[:2]:
-        raise ValueError("Cross-attention query, key, and value batch dimensions must match")
-
-    batch_size, query_length = query_layer.shape[:2]
-    indices_k, cu_seqlens_k, max_seqlen_k = _get_unpad_data(key_padding_mask)
-    query_layer = query_layer.flatten(0, 1)
-    key_layer = _index_first_axis(key_layer, indices_k)
-    value_layer = _index_first_axis(value_layer, indices_k)
-    cu_seqlens_q = torch.arange(
-        0,
-        (batch_size + 1) * query_length,
-        step=query_length,
-        dtype=torch.int32,
-        device=query_layer.device,
-    )
-    return (
-        query_layer,
-        key_layer,
-        value_layer,
-        (cu_seqlens_q, cu_seqlens_k),
-        (query_length, max_seqlen_k),
     )
 
 
@@ -354,7 +285,7 @@ def _upad_input(
         value_layer (`torch.Tensor`):
             Value state with padding. Shape: (batch_size, kv_seq_len, num_key_value_heads, head_dim).
         attention_mask (`torch.Tensor`):
-            Boolean tensor of shape (batch_size, sequence_length), where True means valid.
+            Boolean or int tensor of shape (batch_size, sequence_length), 1 means valid and 0 means not valid.
         query_length (`int`):
             Target length.
         unpad_input_func:
@@ -376,6 +307,9 @@ def _upad_input(
             Maximum sequence length in batch (`max_seqlen_in_batch_q` for the target sequence i.e. query,
             `max_seqlen_in_batch_k` for the source sequence i.e. key/value).
     """
+    if torch.compiler.is_compiling():
+        # allow PyTorch compiler to include operations that return scalar values (like .item()
+        torch._dynamo.config.capture_scalar_outputs = True
     indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
 
     # With static caches, the k/v states may be larger than the mask ->

@@ -1190,29 +1190,8 @@ class QwenImageTransformer2DModel(CachedTransformer):
                 self.parallel_config.sequence_parallel_size,
             )
 
-        if encoder_hidden_states_mask is not None:
-            if encoder_hidden_states_mask.ndim != 2:
-                raise ValueError(
-                    "encoder_hidden_states_mask must be a 2D padding mask with "
-                    f"shape (batch_size, key_length); got {tuple(encoder_hidden_states_mask.shape)}"
-                )
-            if encoder_hidden_states_mask.shape != encoder_hidden_states.shape[:2]:
-                raise ValueError(
-                    "encoder_hidden_states_mask shape must match encoder_hidden_states: "
-                    f"expected {tuple(encoder_hidden_states.shape[:2])}, "
-                    f"got {tuple(encoder_hidden_states_mask.shape)}"
-                )
-            if encoder_hidden_states_mask.is_floating_point() or encoder_hidden_states_mask.is_complex():
-                raise TypeError(
-                    "encoder_hidden_states_mask must be a boolean or integer padding mask, "
-                    "not a floating-point additive attention bias"
-                )
-            encoder_hidden_states_mask = encoder_hidden_states_mask.to(
-                device=encoder_hidden_states.device,
-                dtype=torch.bool,
-            )
-            if encoder_hidden_states_mask.all():
-                encoder_hidden_states_mask = None
+        if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.all():
+            encoder_hidden_states_mask = None
 
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(

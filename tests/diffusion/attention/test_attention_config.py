@@ -497,8 +497,6 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
         assert attn.backend_pref == "TRTLLM_ATTN"
         assert attn.attention.kwargs["backend_kwargs"] == {"target_sparsity": 0.5}
         assert attn.attention.kwargs["qkv_layout"] == "BSND"
-        assert attn.attention.kwargs["role"] == "cross"
-        assert attn.attention.kwargs["role_category"] == "cross"
         assert attn.use_ring is True
         assert attn.ring_runner is not None
         assert attn.ring_runner.attn_backend_pref == "TRTLLM_ATTN"

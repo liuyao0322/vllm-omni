@@ -673,7 +673,13 @@ class SanaCrossAttention(nn.Module):
         value = value.unflatten(2, (self.heads, self.head_dim))
 
         attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
-        hidden_states = self.attn(query, key, value, attn_metadata)
+        if attention_mask is not None:
+            # The Flash masked-varlen path applies one padding mask to Q/K/V,
+            # while SANA's text mask describes only cross-attention K/V.
+            # Use SDPA until Flash supports an independent key-padding mask.
+            hidden_states = self.attn.sdpa_fallback.forward(query, key, value, attn_metadata)
+        else:
+            hidden_states = self.attn(query, key, value, None)
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
 

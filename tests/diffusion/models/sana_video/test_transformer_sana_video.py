@@ -374,22 +374,25 @@ def test_tiny_transformer_matches_diffusers_and_frozen_output():
     torch.testing.assert_close(actual.flatten()[: len(_GOLDEN_PREFIX)], _GOLDEN_PREFIX, rtol=1e-5, atol=1e-5)
 
 
-def test_encoder_attention_mask_uses_omni_padding_mask_contract(monkeypatch):
+def test_encoder_attention_mask_uses_bool_sdpa_contract(monkeypatch):
     from vllm_omni.diffusion.models.sana_video import SanaVideoTransformer3DModel
 
     torch.manual_seed(37)
     model = SanaVideoTransformer3DModel(**_TINY_CONFIG).eval()
     captured = {}
+    omni_attention = model.transformer_blocks[0].attn2.attn
 
-    def fake_attention_forward(query, key, value, attn_metadata):
+    def fake_sdpa_forward(query, key, value, attn_metadata):
         captured["query_shape"] = query.shape
         captured["key_shape"] = key.shape
-        captured["metadata"] = attn_metadata
         captured["mask"] = attn_metadata.attn_mask.detach().clone()
         return torch.zeros_like(query)
 
-    cross_attention = model.transformer_blocks[0].attn2.attn
-    monkeypatch.setattr(cross_attention, "forward", fake_attention_forward)
+    def unexpected_backend_forward(*args, **kwargs):
+        raise AssertionError("masked SANA cross-attention must use SDPA")
+
+    monkeypatch.setattr(omni_attention.sdpa_fallback, "forward", fake_sdpa_forward)
+    monkeypatch.setattr(omni_attention, "forward", unexpected_backend_forward)
 
     hidden_states = torch.randn(2, 4, 3, 4, 4)
     encoder_hidden_states = torch.randn(2, 5, 8)
@@ -413,7 +416,6 @@ def test_encoder_attention_mask_uses_omni_padding_mask_contract(monkeypatch):
     assert captured["query_shape"][:2] == (2, 12)
     assert captured["key_shape"][:2] == (2, 5)
     assert captured["query_shape"][1] != captured["key_shape"][1]
-    assert captured["metadata"] is not None
     assert captured["mask"].shape == (2, 5)
     assert captured["mask"].dtype == torch.bool
     assert torch.equal(captured["mask"], input_mask.bool())
