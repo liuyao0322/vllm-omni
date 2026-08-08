@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -8,8 +9,73 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import torch
+import torch.nn as nn
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+def test_h3_prepares_resolved_cache_state_immediately_before_denoise():
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.partition = "fl2va"
+    pipeline.supported_tasks = frozenset({"t2va"})
+    pipeline.default_video_shift = 12.0
+    pipeline.default_audio_shift = 3.0
+    pipeline.device = torch.device("cpu")
+    pipeline.od_config = SimpleNamespace()
+    cache_spec = object()
+    quality_plan = SimpleNamespace(cache_dit=cache_spec)
+    pipeline._quality_policy = Mock()
+    pipeline._quality_policy.resolve.return_value = quality_plan
+    events = []
+    pipeline._cache_dit_runtime = SimpleNamespace(prepare=lambda spec: events.append(("prepare", spec)))
+    pipeline.encode_prompt = Mock(
+        return_value=(
+            torch.ones(1, 2),
+            torch.ones(1, dtype=torch.long),
+        )
+    )
+
+    def diffuse(**kwargs):
+        events.append(("diffuse", kwargs))
+        return torch.zeros(1), torch.zeros(1)
+
+    pipeline.diffuse = diffuse
+    pipeline.decode = Mock(return_value=(torch.zeros(1), torch.zeros(1)))
+    sampling = OmniDiffusionSamplingParams(
+        quality="high",
+        width=1344,
+        height=768,
+        fps=24,
+        num_frames=124,
+        num_inference_steps=50,
+        extra_args={"task": "t2va", "aspect_ratio": "16:9"},
+    )
+    batch = DiffusionRequestBatch(
+        [
+            OmniDiffusionRequest(
+                prompt="quality boundary",
+                sampling_params=sampling,
+                request_id="quality-boundary",
+            )
+        ]
+    )
+
+    output = pipeline.forward(batch)
+
+    assert events[0] == ("prepare", cache_spec)
+    assert events[1][0] == "diffuse"
+    pipeline._quality_policy.resolve.assert_called_once_with(
+        quality="high",
+        num_inference_steps=50,
+        extra_args={"task": "t2va", "aspect_ratio": "16:9"},
+    )
+    assert output.output == pipeline.decode.return_value
 
 
 def test_pipeline_import_registry_and_component_discovery():
@@ -24,10 +90,334 @@ def test_pipeline_import_registry_and_component_discovery():
         "pipeline_minimax_h3",
         "MiniMaxH3Pipeline",
     )
+    assert _DIFFUSION_MODELS["MiniMaxH3ModularPipeline"] == _DIFFUSION_MODELS["MiniMaxH3Pipeline"]
     assert _DIFFUSION_POST_PROCESS_FUNCS["MiniMaxH3Pipeline"] == "get_minimax_h3_post_process_func"
-    assert MiniMaxH3Pipeline._dit_modules == ["transformer"]
+    assert (
+        _DIFFUSION_POST_PROCESS_FUNCS["MiniMaxH3ModularPipeline"] == _DIFFUSION_POST_PROCESS_FUNCS["MiniMaxH3Pipeline"]
+    )
+    assert MiniMaxH3Pipeline._dit_modules == ["transformer", "transformers_ref"]
     assert MiniMaxH3Pipeline._encoder_modules == ["text_encoder"]
     assert MiniMaxH3Pipeline._vae_modules == ["video_vae", "audio_vae"]
+
+
+def _write_partition_index(path, *, partition, tasks):
+    path.mkdir(parents=True)
+    (path / "model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "MiniMaxH3Pipeline",
+                "_diffusers_version": "0.32.2",
+                "_minimax_h3": {
+                    "partition": partition,
+                    "tasks": tasks,
+                    "sigma_shift_scales": {"video": 12.0, "audio": 3.0},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_modular_diffusers_index_is_resolved_generically(tmp_path):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig, resolve_model_class_name
+    from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
+    from vllm_omni.entrypoints.utils import resolve_model_config_path
+
+    (tmp_path / "modular_model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "MiniMaxH3ModularPipeline",
+                "_diffusers_version": "0.36.0.dev0",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert is_diffusion_model(str(tmp_path))
+    assert resolve_model_class_name(str(tmp_path)) == "MiniMaxH3ModularPipeline"
+    assert resolve_model_config_path(str(tmp_path)) is None
+
+    config = OmniDiffusionConfig(model=str(tmp_path))
+    config.enrich_config()
+    assert config.model_class_name == "MiniMaxH3ModularPipeline"
+    assert config.supports_multimodal_inputs
+    assert config.max_multimodal_image_inputs == 9
+    assert config.supports_mixed_reference_inputs
+
+
+@pytest.mark.parametrize(
+    ("task_type", "partition"),
+    [
+        (None, "combined"),
+        ("auto", "combined"),
+        ("t2va", "fl2va"),
+        ("fl2va", "fl2va"),
+        ("ref2va", "ref2va"),
+    ],
+)
+def test_startup_task_selects_weight_partition(task_type, partition):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _minimax_h3_partition_for_task
+
+    assert _minimax_h3_partition_for_task(task_type) == partition
+
+
+def test_startup_auto_task_uses_explicit_local_partition(tmp_path):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _minimax_h3_partition_for_task
+
+    for directory, partition, tasks in (
+        ("FL2VA", "fl2va", ["t2va", "fl2va"]),
+        ("Ref2VA", "ref2va", ["ref2va"]),
+    ):
+        model_path = tmp_path / directory
+        _write_partition_index(model_path, partition=partition, tasks=tasks)
+        assert _minimax_h3_partition_for_task(None, str(model_path)) == partition
+        assert _minimax_h3_partition_for_task("auto", str(model_path)) == partition
+        assert _minimax_h3_partition_for_task("combined", str(model_path)) == "combined"
+
+
+def test_startup_task_rejects_unsupported_value():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _minimax_h3_partition_for_task
+
+    with pytest.raises(ValueError, match="task_type must be one of"):
+        _minimax_h3_partition_for_task("unsupported")
+
+
+def test_combined_task_inference_and_transformer_routing():
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.partition = "combined"
+    pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
+    pipeline.transformer = torch.nn.Identity()
+    pipeline.transformers_ref = torch.nn.Linear(1, 1)
+    assert pipeline._resolve_task(None, {}) == "t2va"
+    assert pipeline._resolve_task(None, {"image": object()}) == "fl2va"
+    assert pipeline._resolve_task(None, {"audio": object()}) == "ref2va"
+    assert pipeline._resolve_task(None, {"video": object()}) == "ref2va"
+    pipeline.partition = "ref2va"
+    pipeline.supported_tasks = frozenset({"ref2va"})
+    assert pipeline._resolve_task(None, {"image": object()}) == "ref2va"
+
+    pipeline.partition = "combined"
+    pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
+    assert pipeline._transformer_for_task("fl2va") is pipeline.transformer
+    assert pipeline._transformer_for_task("ref2va") is pipeline.transformers_ref
+
+
+@pytest.mark.parametrize(
+    (
+        "task_type",
+        "expected_partition",
+        "expected_dits",
+        "component_partition",
+        "source_partitions",
+        "expected_tasks",
+    ),
+    [
+        (None, "combined", 2, "FL2VA", ["FL2VA", "Ref2VA"], {"t2va", "fl2va", "ref2va"}),
+        ("fl2va", "fl2va", 1, "FL2VA", ["FL2VA"], {"t2va", "fl2va"}),
+        ("ref2va", "ref2va", 1, "Ref2VA", ["Ref2VA"], {"ref2va"}),
+    ],
+)
+def test_pipeline_loads_task_selected_dits_and_shared_components_once(
+    monkeypatch,
+    tmp_path,
+    task_type,
+    expected_partition,
+    expected_dits,
+    component_partition,
+    source_partitions,
+    expected_tasks,
+):
+    from vllm_omni.diffusion.data import (
+        DiffusionParallelConfig,
+        OmniDiffusionConfig,
+    )
+    from vllm_omni.diffusion.models.minimax_h3 import (
+        pipeline_minimax_h3 as pipeline_module,
+    )
+
+    _write_partition_index(
+        tmp_path / "FL2VA",
+        partition="fl2va",
+        tasks=["t2va", "fl2va"],
+    )
+    _write_partition_index(
+        tmp_path / "Ref2VA",
+        partition="ref2va",
+        tasks=["ref2va"],
+    )
+    for partition_name in ("FL2VA", "Ref2VA"):
+        for component in (
+            "transformer",
+            "tokenizer",
+            "processor",
+            "text_encoder",
+            "video_vae",
+            "audio_vae",
+        ):
+            (tmp_path / partition_name / component).mkdir()
+
+    created = {"dit": [], "text_encoder": [], "video_vae": [], "audio_vae": []}
+
+    class FakeModule(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    class FakeDiT(FakeModule):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            created["dit"].append((args, kwargs))
+
+    def component_factory(name):
+        def create(path, *args, **kwargs):
+            created[name].append(str(path))
+            return FakeModule()
+
+        return create
+
+    tokenizer_calls = []
+    processor_calls = []
+    tokenizer_cls = Mock(spec=pipeline_module.Qwen2TokenizerFast)
+    tokenizer_cls.from_pretrained.side_effect = lambda *args, **kwargs: (
+        tokenizer_calls.append((args, kwargs)) or object()
+    )
+    processor_cls = Mock(spec=pipeline_module.Qwen3VLProcessor)
+    processor_cls.from_pretrained.side_effect = lambda *args, **kwargs: (
+        processor_calls.append((args, kwargs)) or object()
+    )
+    monkeypatch.setattr(pipeline_module, "MiniMaxH3DiTModel", FakeDiT)
+    monkeypatch.setattr(
+        pipeline_module,
+        "MiniMaxH3Qwen3VLEncoder",
+        component_factory("text_encoder"),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "MiniMaxH3VideoVAE",
+        component_factory("video_vae"),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "MiniMaxH3AudioVAE",
+        component_factory("audio_vae"),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "Qwen2TokenizerFast",
+        tokenizer_cls,
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "Qwen3VLProcessor",
+        processor_cls,
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_dit_rank_world",
+        lambda: (None, 0, 1),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "get_local_device",
+        lambda: torch.device("cpu"),
+    )
+    download_calls = []
+
+    def fake_download(**kwargs):
+        download_calls.append(kwargs)
+        return str(tmp_path)
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "download_weights_from_hf_specific",
+        fake_download,
+    )
+
+    od_config = OmniDiffusionConfig(
+        model="MiniMaxAI/MiniMax-H3",
+        revision=None,
+        task_type=task_type,
+        quantization_config=None,
+        parallel_config=DiffusionParallelConfig(
+            cfg_parallel_size=1,
+            text_encoder_tp_size=1,
+        ),
+    )
+    pipeline = pipeline_module.MiniMaxH3Pipeline(od_config=od_config)
+
+    assert pipeline.partition == expected_partition
+    assert pipeline.supported_tasks == expected_tasks
+    assert len(created["dit"]) == expected_dits
+    component_path = tmp_path / component_partition
+    assert created["text_encoder"] == [str(component_path / "text_encoder")]
+    assert created["video_vae"] == [str(component_path / "video_vae")]
+    assert created["audio_vae"] == [str(component_path / "audio_vae")]
+    assert len(tokenizer_calls) == 1
+    assert len(processor_calls) == 1
+    expected_dit_modules = ["transformer", "transformers_ref"] if expected_dits == 2 else ["transformer"]
+    assert pipeline._dit_modules == expected_dit_modules
+    assert hasattr(pipeline, "transformers_ref") is (expected_dits == 2)
+    if expected_partition == "ref2va":
+        assert pipeline._transformer_for_task("ref2va") is pipeline.transformer
+    assert [source.model_or_path for source in pipeline.weights_sources] == [
+        str(tmp_path / partition_name) for partition_name in source_partitions
+    ]
+    expected_patterns = (
+        pipeline_module.MINIMAX_H3_DOWNLOAD_PATTERNS
+        if expected_partition == "combined"
+        else pipeline_module.MINIMAX_H3_TASK_DOWNLOAD_PATTERNS[expected_partition]
+    )
+    assert download_calls == [
+        {
+            "model_name_or_path": "MiniMaxAI/MiniMax-H3",
+            "cache_dir": None,
+            "allow_patterns": expected_patterns,
+            "revision": None,
+            "require_all": True,
+        }
+    ]
+
+
+def test_combined_weight_loader_routes_each_contiguous_partition():
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    class FakeTransformer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.loaded = []
+            self.post_load_calls = 0
+
+        def load_weights(self, weights):
+            self.loaded = [name for name, _ in weights]
+            return set(self.loaded)
+
+        def post_load_weights(self):
+            self.post_load_calls += 1
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.transformer = FakeTransformer()
+    pipeline.transformers_ref = FakeTransformer()
+    pipeline.text_encoder = torch.nn.Identity()
+    pipeline.video_vae = torch.nn.Identity()
+    pipeline.audio_vae = torch.nn.Identity()
+    loaded = pipeline.load_weights(
+        iter(
+            [
+                ("transformer.a", torch.ones(1)),
+                ("transformer.b", torch.ones(1)),
+                ("transformers_ref.a", torch.ones(1)),
+            ]
+        )
+    )
+
+    assert pipeline.transformer.loaded == ["a", "b"]
+    assert pipeline.transformers_ref.loaded == ["a"]
+    assert pipeline.transformer.post_load_calls == 1
+    assert pipeline.transformers_ref.post_load_calls == 1
+    assert loaded == {"transformer.a", "transformer.b", "transformers_ref.a"}
 
 
 def test_dlo_offload_plan_includes_token_refiner():
@@ -449,6 +839,21 @@ def test_distributed_layerwise_resident_blocks_release_on_failure():
 
     controller.load_resident_layers.assert_called_once_with()
     controller.offload_resident_layers.assert_called_once_with()
+
+
+def test_distributed_layerwise_resident_blocks_can_be_skipped():
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    controller = Mock()
+    pipeline._dlo_residency_controller = controller
+
+    with pipeline._resident_dit_layers_on_device(enabled=False):
+        pass
+
+    controller.load_resident_layers.assert_not_called()
+    controller.offload_resident_layers.assert_not_called()
 
 
 def test_encoder_layerwise_offload_keeps_tp_blocks_rank_local(monkeypatch):
@@ -1061,3 +1466,149 @@ def test_g4_reference_video_metadata_validation(field, value, message, tmp_path)
     metadata[field] = value
     with pytest.raises(ValueError, match=message):
         _validate_reference_video_metadata(metadata, index=0, source=str(tmp_path / "reference.mp4"))
+
+
+_ENCODER_HIDDEN = 4
+_ENCODER_HEAD_DIM = 2
+_ENCODER_NUM_HEADS = 2
+_ENCODER_NUM_KV_HEADS = 1
+_ENCODER_INTERMEDIATE = 4
+
+# One distinct value per checkpoint tensor, none of them a parameter initializer
+# (fused weights start as `torch.empty`, norms as ones). A uniform fill would
+# prove only that every row was written, not that each source landed in its own
+# row range, which is the invariant the fused loaders have to get right.
+_SOURCE_FILL = {
+    "self_attn.q_proj.weight": 3.0,
+    "self_attn.k_proj.weight": 4.0,
+    "self_attn.v_proj.weight": 5.0,
+    "mlp.gate_proj.weight": 6.0,
+    "mlp.up_proj.weight": 7.0,
+    "input_layernorm.weight": 8.0,
+}
+
+_QKV_TARGET = "text_model.layers.0.self_attn.qkv_proj.weight"
+_GATE_UP_TARGET = "text_model.layers.0.mlp.gate_up_proj.weight"
+_NORM_TARGET = "text_model.layers.0.input_layernorm.weight"
+
+
+def _one_layer_text_encoder():
+    """Encoder stub holding both fused weights plus one plain parameter."""
+    from vllm_omni.diffusion.models.minimax_h3.encoder import (
+        MiniMaxH3Qwen3VLEncoder,
+        MiniMaxH3Qwen3VLMergedColumnParallelLinear,
+        MiniMaxH3Qwen3VLQKVParallelLinear,
+        MiniMaxH3Qwen3VLRMSNorm,
+    )
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _SingleRankEncoderGroup
+
+    group = _SingleRankEncoderGroup(0)
+    layer = nn.Module()
+    layer.self_attn = nn.Module()
+    layer.self_attn.qkv_proj = MiniMaxH3Qwen3VLQKVParallelLinear(
+        group,
+        hidden_size=_ENCODER_HIDDEN,
+        num_heads=_ENCODER_NUM_HEADS,
+        num_kv_heads=_ENCODER_NUM_KV_HEADS,
+        head_dim=_ENCODER_HEAD_DIM,
+        dtype=torch.float32,
+    )
+    layer.mlp = nn.Module()
+    layer.mlp.gate_up_proj = MiniMaxH3Qwen3VLMergedColumnParallelLinear(
+        group,
+        input_size=_ENCODER_HIDDEN,
+        intermediate_size=_ENCODER_INTERMEDIATE,
+        dtype=torch.float32,
+    )
+    layer.input_layernorm = MiniMaxH3Qwen3VLRMSNorm(_ENCODER_HIDDEN)
+
+    encoder = object.__new__(MiniMaxH3Qwen3VLEncoder)
+    nn.Module.__init__(encoder)
+    encoder.text_model = nn.Module()
+    encoder.text_model.layers = nn.ModuleList([layer])
+    return encoder
+
+
+def _write_text_encoder_checkpoint(path, *, omit=()):
+    """Write a one-layer Qwen3-VL-named checkpoint, one fill value per source."""
+    import json
+
+    import safetensors.torch
+
+    prefix = "model.language_model.layers.0"
+    q_rows = _ENCODER_NUM_HEADS * _ENCODER_HEAD_DIM
+    kv_rows = _ENCODER_NUM_KV_HEADS * _ENCODER_HEAD_DIM
+    shapes = {
+        "self_attn.q_proj.weight": (q_rows, _ENCODER_HIDDEN),
+        "self_attn.k_proj.weight": (kv_rows, _ENCODER_HIDDEN),
+        "self_attn.v_proj.weight": (kv_rows, _ENCODER_HIDDEN),
+        "mlp.gate_proj.weight": (_ENCODER_INTERMEDIATE, _ENCODER_HIDDEN),
+        "mlp.up_proj.weight": (_ENCODER_INTERMEDIATE, _ENCODER_HIDDEN),
+        "input_layernorm.weight": (_ENCODER_HIDDEN,),
+    }
+    tensors = {f"{prefix}.{source}": torch.full(shape, _SOURCE_FILL[source]) for source, shape in shapes.items()}
+    for source in omit:
+        del tensors[f"{prefix}.{source}"]
+    safetensors.torch.save_file(tensors, str(path / "model.safetensors"))
+    index = {"weight_map": dict.fromkeys(tensors, "model.safetensors")}
+    (path / "model.safetensors.index.json").write_text(json.dumps(index))
+
+
+@pytest.mark.parametrize(
+    ("omitted_sources", "expected_detail", "unreported_target"),
+    [
+        (("self_attn.q_proj.weight",), f"{_QKV_TARGET}: ['q']", _GATE_UP_TARGET),
+        (("self_attn.k_proj.weight",), f"{_QKV_TARGET}: ['k']", _GATE_UP_TARGET),
+        (("self_attn.v_proj.weight",), f"{_QKV_TARGET}: ['v']", _GATE_UP_TARGET),
+        (("mlp.gate_proj.weight",), f"{_GATE_UP_TARGET}: ['gate']", _QKV_TARGET),
+        (("mlp.up_proj.weight",), f"{_GATE_UP_TARGET}: ['up']", _QKV_TARGET),
+        (
+            ("self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight"),
+            f"{_QKV_TARGET}: ['q', 'k', 'v']",
+            _GATE_UP_TARGET,
+        ),
+    ],
+)
+def test_encoder_load_reports_missing_fused_source_shards(
+    tmp_path, omitted_sources, expected_detail, unreported_target
+):
+    encoder = _one_layer_text_encoder()
+    _write_text_encoder_checkpoint(tmp_path, omit=omitted_sources)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        encoder._load_weights(str(tmp_path))
+
+    message = str(excinfo.value)
+    assert expected_detail in message
+    assert unreported_target not in message
+
+
+def test_encoder_load_rejects_unloaded_plain_param(tmp_path):
+    encoder = _one_layer_text_encoder()
+    _write_text_encoder_checkpoint(tmp_path, omit=("input_layernorm.weight",))
+
+    with pytest.raises(RuntimeError, match=r"weights not loaded.*input_layernorm"):
+        encoder._load_weights(str(tmp_path))
+
+
+def test_encoder_load_places_every_source_in_its_own_rows(tmp_path):
+    encoder = _one_layer_text_encoder()
+    _write_text_encoder_checkpoint(tmp_path)
+
+    encoder._load_weights(str(tmp_path))
+
+    params = dict(encoder.named_parameters())
+    q_rows = _ENCODER_NUM_HEADS * _ENCODER_HEAD_DIM
+    kv_rows = _ENCODER_NUM_KV_HEADS * _ENCODER_HEAD_DIM
+    qkv = params[_QKV_TARGET]
+    gate_up = params[_GATE_UP_TARGET]
+    slices = {
+        "self_attn.q_proj.weight": qkv[:q_rows],
+        "self_attn.k_proj.weight": qkv[q_rows : q_rows + kv_rows],
+        "self_attn.v_proj.weight": qkv[q_rows + kv_rows :],
+        "mlp.gate_proj.weight": gate_up[:_ENCODER_INTERMEDIATE],
+        "mlp.up_proj.weight": gate_up[_ENCODER_INTERMEDIATE:],
+        "input_layernorm.weight": params[_NORM_TARGET],
+    }
+    for source, rows in slices.items():
+        assert torch.equal(rows, torch.full_like(rows, _SOURCE_FILL[source])), source
