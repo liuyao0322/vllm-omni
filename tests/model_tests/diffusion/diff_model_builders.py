@@ -110,6 +110,8 @@ def tiny_sana_video_builder() -> str:
     )
     pipeline.to(dtype=torch.bfloat16).save_pretrained(model_dir)
     return model_dir
+
+
 def _shrink_flux_clip_text_encoder(config: dict) -> dict:
     config["num_hidden_layers"] = 2
     return config
