@@ -10,6 +10,10 @@ video generation using vLLM-Omni.
 | Wan2.2 I2V | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` |
 | SANA-Video 2B (480p) | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` |
 | SANA-Video 2B (720p) | `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` |
+This example demonstrates online image-to-video generation with vLLM-Omni.
+The startup script defaults to Wan2.2, but `MODEL` can select any supported
+image-to-video model. The existing curl helper remains a concrete Wan2.2
+request through the standard Videos API.
 
 ## Start Server
 
@@ -29,9 +33,7 @@ bash run_server.sh
 
 The script allows overriding:
 - `MODEL` (default: `Wan-AI/Wan2.2-I2V-A14B-Diffusers`)
-- `PORT` (default: `8091`)
-- `BOUNDARY_RATIO` (default: `0.875`)
-- `FLOW_SHIFT` (default: `12.0`)
+- `PORT` (default: `8099`)
 - `CACHE_BACKEND` (default: `none`)
 - `ENABLE_CACHE_DIT_SUMMARY` (default: `0`)
 
