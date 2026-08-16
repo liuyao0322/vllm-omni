@@ -27,6 +27,9 @@ EXCLUDED_MODELS = [
     "OvisImagePipeline",
     "WanPipeline",
     "WanVACEPipeline",
+    "LTX2TwoStagePipeline",
+    "LTX2DistilledOneStagePipeline",
+    "LTX2DistilledTwoStagePipeline",
     "LTX2DistilledPipeline",
     "LTX2T2VDMD2Pipeline",
     "LTX2I2VDMD2Pipeline",
@@ -67,6 +70,9 @@ EXCLUDED_MODELS = [
     # tests/e2e/online_serving/test_sana_video_expansion.py. SANA T2V is exercised through
     # the common tiny-model setting in model_settings.py.
     "SanaImageToVideoPipeline",
+    # Requires camera/action assets and persistent AR state; covered by its
+    # dedicated contract tests and real-checkpoint E2E smoke instead.
+    "LingBotWorldCausalDMDPipeline",
     "MagiHumanPipeline",
     "OmniVoicePipeline",
     "OmniVoice",
