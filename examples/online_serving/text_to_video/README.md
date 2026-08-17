@@ -14,6 +14,9 @@ This example demonstrates how to deploy text-to-video models for online video ge
 | SANA-Video 2B (480p) | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` |
 | SANA-Video 2B (720p) | `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` |
 
+For SANA-Video 2B text-to-video online serving, see the
+[SANA-Video 2B recipe](../../../recipes/NVIDIA/SANA-Video-2B.md).
+
 ## Wan2.2 T2V
 
 ### Start Server
@@ -39,52 +42,6 @@ The script allows overriding:
 - `FLOW_SHIFT` (default: `5.0`)
 - `CACHE_BACKEND` (default: `none`)
 - `ENABLE_CACHE_DIT_SUMMARY` (default: `0`)
-
-## SANA-Video 2B T2V
-
-SANA-Video supports native and Diffusers-adapter text-to-video serving with
-both released checkpoints:
-
-| Checkpoint | Default output | VAE |
-| :--------- | :------------- | :-- |
-| `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` | 832 x 480 | Wan VAE |
-| `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` | 1280 x 704 | LTX-2 VAE |
-
-Start the native 480p pipeline and send a synchronous request:
-
-```bash
-MODEL=Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
-  bash run_server_sana_video.sh
-
-bash run_curl_sana_video.sh
-```
-
-The server helper selects `SanaVideoPipeline`. The request generates the
-standard checkpoint profile of 81 frames at 16 FPS with 50 denoising steps
-and passes `motion_score` through `extra_params`.
-
-For 720p, load the 720p checkpoint and send the same request with
-`width=1280` and `height=704`. If dimensions are omitted, the native pipeline
-derives its defaults from the loaded checkpoint.
-
-Use the Diffusers adapter when you need a black-box compatibility baseline:
-
-```bash
-MODEL=Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
-  bash run_server_sana_video_diffusers.sh
-
-bash run_curl_sana_video.sh
-```
-
-The adapter is validated with both checkpoint variants. Its server helper
-selects `TORCH_SDPA` because the SANA-Video attention mask is not accepted by
-the AITER-backed Diffusers attention path. Requests continue to use the same
-`/v1/videos` API; `num_frames` is adapted to the Diffusers pipeline's `frames`
-argument.
-
-For architecture details, measured memory usage, offline commands, and the
-full T2V/I2V support matrix, see the
-[SANA-Video 2B recipe](../../../recipes/NVIDIA/SANA-Video-2B.md).
 
 ## Async Job Behavior
 

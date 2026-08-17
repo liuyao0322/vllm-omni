@@ -10,6 +10,10 @@ video generation using vLLM-Omni.
 | Wan2.2 I2V | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` |
 | SANA-Video 2B (480p) | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` |
 | SANA-Video 2B (720p) | `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` |
+
+For SANA-Video 2B image-to-video online serving, see the
+[SANA-Video 2B recipe](../../../recipes/NVIDIA/SANA-Video-2B.md).
+
 This example demonstrates online image-to-video generation with vLLM-Omni.
 The startup script defaults to Wan2.2, but `MODEL` can select any supported
 image-to-video model. The existing curl helper remains a concrete Wan2.2
@@ -36,62 +40,6 @@ The script allows overriding:
 - `PORT` (default: `8099`)
 - `CACHE_BACKEND` (default: `none`)
 - `ENABLE_CACHE_DIT_SUMMARY` (default: `0`)
-
-### SANA-Video-2B
-
-The released checkpoint indexes identify the T2V pipeline, so I2V serving
-must explicitly select `SanaImageToVideoPipeline`. The native SANA I2V
-pipeline supports both released checkpoints:
-
-```bash
-# 480p
-MODEL=Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
-  bash run_server_sana_video.sh
-
-INPUT_IMAGE=/path/to/input.jpg \
-  bash run_curl_sana_video.sh
-```
-
-For native 720p I2V, start the server with
-`Efficient-Large-Model/SANA-Video_2B_720p_diffusers` and call the client with
-`WIDTH=1280 HEIGHT=704` in addition to `INPUT_IMAGE`.
-
-Both checkpoints use 81 frames at 16 FPS as their standard generation
-profile. The client passes `motion_score` through `extra_params` and supports
-overriding `WIDTH`, `HEIGHT`, and `OUTPUT_PATH`.
-
-The Diffusers-adapter compatibility path is validated at both resolutions:
-
-```bash
-# 480p
-MODEL=Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
-  bash run_server_sana_video_diffusers.sh
-
-INPUT_IMAGE=/path/to/input.jpg OUTPUT_PATH=sana_video_i2v_adapter.mp4 \
-  bash run_curl_sana_video.sh
-
-# 720p
-MODEL=Efficient-Large-Model/SANA-Video_2B_720p_diffusers \
-  bash run_server_sana_video_diffusers.sh
-
-INPUT_IMAGE=/path/to/input.jpg WIDTH=1280 HEIGHT=704 \
-  OUTPUT_PATH=sana_video_i2v_adapter_720p.mp4 \
-  bash run_curl_sana_video.sh
-```
-
-Native 480p uses the
-`DistributedAutoencoderKLWan` wrapper; native 720p uses
-`DistributedAutoencoderKLLTX2Video`. These wrappers retain the corresponding
-Diffusers autoencoder implementations, and the native SANA denoising loop
-intentionally retains Diffusers' `DPMSolverMultistepScheduler`.
-
-The adapter server helper selects `TORCH_SDPA` because the SANA-Video
-attention mask is not accepted by the AITER-backed Diffusers attention path.
-Requests use the same `/v1/videos` API as the native pipeline.
-
-For architecture details, measured memory usage, offline commands, and the
-full T2V/I2V support matrix, see the
-[SANA-Video 2B recipe](../../../recipes/NVIDIA/SANA-Video-2B.md).
 
 ### Ascend / Local LightX2V Example
 
