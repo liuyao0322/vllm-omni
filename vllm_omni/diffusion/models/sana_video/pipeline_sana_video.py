@@ -701,10 +701,7 @@ class SanaVideoPipeline(
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
 
-        if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-        else:
-            latents = latents.to(device=device, dtype=dtype)
+        latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         return latents
 
     @property
@@ -771,7 +768,7 @@ class SanaVideoPipeline(
             eta=sampling.eta,
             generator=generator,
             latents=sampling.latents,
-            output_type="raw",
+            output_type="latent" if sampling.output_type == "latent" else "raw",
             clean_caption=bool(extra_args.get("clean_caption", False)),
             use_resolution_binning=bool(extra_args.get("use_resolution_binning", True)),
             max_sequence_length=sampling.max_sequence_length or 300,

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import numpy as np
@@ -191,6 +192,21 @@ def test_sana_video_diffusers_still_postprocesses_native_tensor(factory_name):
     assert result["payload"]["video"].shape == (1, 2, 16, 16, 3)
 
 
+@pytest.mark.parametrize(
+    "factory_name",
+    ["get_sana_video_post_process_func", "get_sana_video_i2v_post_process_func"],
+)
+def test_sana_video_postprocess_preserves_requested_latents(factory_name):
+    from vllm_omni.diffusion.models import sana_video
+
+    latents = torch.randn(1, 4, 2, 2, 2)
+    post_process = getattr(sana_video, factory_name)(SimpleNamespace(diffusion_load_format="native"))
+
+    result = post_process(latents, sampling_params=SimpleNamespace(output_type="latent"))
+
+    assert result is latents
+
+
 def test_sana_video_720p_model_id_fallback(monkeypatch):
     from vllm_omni.diffusion.models.sana_video import pipeline_sana_video
 
@@ -203,7 +219,15 @@ def test_sana_video_720p_model_id_fallback(monkeypatch):
     assert pipeline_sana_video.resolve_sana_video_sample_size(od_config) == 22
 
 
-def test_sana_video_i2v_forward_maps_image_request():
+@pytest.mark.parametrize(
+    ("requested_output_type", "expected_internal_output_type"),
+    [
+        (None, "raw"),
+        ("np", "raw"),
+        ("latent", "latent"),
+    ],
+)
+def test_sana_video_i2v_forward_maps_image_request(requested_output_type, expected_internal_output_type):
     from vllm_omni.diffusion.models.sana_video import SanaImageToVideoPipeline
 
     pipeline = object.__new__(SanaImageToVideoPipeline)
@@ -225,6 +249,7 @@ def test_sana_video_i2v_forward_maps_image_request():
         num_inference_steps=2,
         guidance_scale=4.5,
         seed=42,
+        output_type=requested_output_type,
         extra_args={"motion_score": 30, "use_resolution_binning": False},
     )
 
@@ -236,6 +261,83 @@ def test_sana_video_i2v_forward_maps_image_request():
     assert calls[0]["negative_prompt"] == "blurry"
     assert calls[0]["frames"] == 9
     assert calls[0]["generator"].initial_seed() == 42
+    assert calls[0]["output_type"] == expected_internal_output_type
+
+
+def test_sana_video_i2v_latent_output_skips_vae_decode(monkeypatch):
+    from vllm_omni.diffusion.models.sana_video import SanaImageToVideoPipeline, pipeline_sana_video_i2v
+
+    class StubTransformer:
+        dtype = torch.float32
+        config = SimpleNamespace(
+            sample_size=30,
+            in_channels=4,
+            out_channels=4,
+            patch_size=(1, 1, 1),
+        )
+
+        def __call__(self, hidden_states, **_kwargs):
+            return (torch.zeros_like(hidden_states),)
+
+    class StubScheduler:
+        order = 1
+
+        def step(self, _noise_pred, _timestep, current_latents, return_dict=False):
+            assert return_dict is False
+            return (current_latents + 1,)
+
+    class VaeMustNotBeUsed:
+        @property
+        def dtype(self):
+            pytest.fail("latent output must return before accessing the VAE")
+
+        def decode(self, *_args, **_kwargs):
+            pytest.fail("latent output must not call VAE decode")
+
+    pipeline = object.__new__(SanaImageToVideoPipeline)
+    pipeline.device = torch.device("cpu")
+    pipeline.transformer = StubTransformer()
+    pipeline.scheduler = StubScheduler()
+    pipeline.vae = VaeMustNotBeUsed()
+    pipeline.check_inputs = lambda **_kwargs: None
+    pipeline.video_processor = SimpleNamespace(
+        preprocess=lambda _image, height, width: torch.zeros(1, 3, height, width),
+    )
+    pipeline.encode_prompt = lambda *_args, **_kwargs: (
+        torch.zeros(1, 1, 1),
+        torch.ones(1, 1, dtype=torch.bool),
+        torch.zeros(1, 1, 1),
+        torch.ones(1, 1, dtype=torch.bool),
+    )
+    pipeline.progress_bar = lambda **_kwargs: nullcontext(SimpleNamespace(update=lambda: None))
+
+    initial_latents = torch.zeros(1, 4, 2, 2, 2)
+    pipeline._prepare_i2v_latents = lambda *_args, **_kwargs: initial_latents
+    monkeypatch.setattr(
+        pipeline_sana_video_i2v,
+        "retrieve_timesteps",
+        lambda *_args, **_kwargs: (torch.tensor([1.0]), 1),
+    )
+
+    output = pipeline._generate_i2v(
+        image=Image.new("RGB", (2, 2)),
+        prompt="test",
+        negative_prompt="",
+        height=2,
+        width=2,
+        frames=2,
+        num_inference_steps=1,
+        guidance_scale=1.0,
+        generator=None,
+        latents=None,
+        use_resolution_binning=False,
+        max_sequence_length=1,
+        output_type="latent",
+    )
+
+    expected = initial_latents.clone()
+    expected[:, :, 1:] += 1
+    torch.testing.assert_close(output, expected)
 
 
 def test_sana_video_i2v_uses_diffusers_complex_instruction_default():
@@ -510,7 +612,15 @@ def test_check_inputs_uses_variant_spatial_alignment(vae_scale, patch_size, vali
         pipeline.check_inputs(prompt="test", height=invalid_size, width=valid_size)
 
 
-def test_forward_maps_omni_request_to_sana_generation_args():
+@pytest.mark.parametrize(
+    ("requested_output_type", "expected_internal_output_type"),
+    [
+        (None, "raw"),
+        ("np", "raw"),
+        ("latent", "latent"),
+    ],
+)
+def test_forward_maps_omni_request_to_sana_generation_args(requested_output_type, expected_internal_output_type):
     from vllm_omni.diffusion.models.sana_video import SanaVideoPipeline
 
     pipeline = object.__new__(SanaVideoPipeline)
@@ -530,6 +640,7 @@ def test_forward_maps_omni_request_to_sana_generation_args():
         num_inference_steps=2,
         guidance_scale=4.5,
         seed=42,
+        output_type=requested_output_type,
         extra_args={"motion_score": 30, "use_resolution_binning": False},
     )
 
@@ -545,6 +656,7 @@ def test_forward_maps_omni_request_to_sana_generation_args():
     assert calls[0]["guidance_scale"] == 4.5
     assert calls[0]["use_resolution_binning"] is False
     assert calls[0]["generator"].initial_seed() == 42
+    assert calls[0]["output_type"] == expected_internal_output_type
 
 
 @pytest.mark.parametrize(

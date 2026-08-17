@@ -212,6 +212,7 @@ class SanaImageToVideoPipeline(SanaVideoPipeline, SupportImageInput):
             latents=sampling.latents,
             use_resolution_binning=bool(extra_args.get("use_resolution_binning", True)),
             max_sequence_length=sampling.max_sequence_length or 300,
+            output_type="latent" if sampling.output_type == "latent" else "raw",
         )
         return DiffusionOutput(output=video)
 
@@ -231,6 +232,7 @@ class SanaImageToVideoPipeline(SanaVideoPipeline, SupportImageInput):
         latents: torch.Tensor | None,
         use_resolution_binning: bool,
         max_sequence_length: int,
+        output_type: str = "raw",
         complex_human_instruction: list[str] = SANA_VIDEO_I2V_COMPLEX_HUMAN_INSTRUCTION,
     ) -> torch.Tensor:
         orig_height, orig_width = height, width
@@ -331,6 +333,9 @@ class SanaImageToVideoPipeline(SanaVideoPipeline, SupportImageInput):
                 latents = torch.cat([latents[:, :, :1], denoised], dim=2)
                 if index == len(timesteps) - 1 or (index + 1) % self.scheduler.order == 0:
                     progress_bar.update()
+
+        if output_type == "latent":
+            return latents
 
         latents = latents.to(self.vae.dtype)
         if isinstance(self.vae, DistributedAutoencoderKLLTX2Video):
