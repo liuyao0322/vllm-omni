@@ -11,7 +11,7 @@ from tests.helpers.mark import hardware_marks
 from tests.helpers.media import generate_synthetic_image
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
