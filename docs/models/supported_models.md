@@ -78,8 +78,6 @@ th {
 | `FluxPipeline` | FLUX.1-schnell | `black-forest-labs/FLUX.1-schnell` | ✅︎ | ✅︎ | | ✅︎ | — |
 | `OmniGen2Pipeline` | OmniGen2 | `OmniGen2/OmniGen2` | ✅︎ | ✅︎ | | ✅︎ | — |
 | `StableAudioPipeline` | Stable-Audio-Open | `stabilityai/stable-audio-open-1.0` | ✅︎ | ✅︎ | | ✅︎ | — |
-| `SoulXSingerPipeline` | SoulX-Singer (SVS) | `Soul-AILab/SoulX-Singer` | ✅︎ | | | | — |
-| `SoulXSingerSVCPipeline` | SoulX-Singer-SVC | `Soul-AILab/SoulX-Singer` (`model-svc.pt`) | ✅︎ | | | | — |
 | `AudioXPipeline` | AudioX | `zhangj1an/AudioX` | ✅︎ | ✅︎ | | | — |
 | `MiniMaxMusic3ForConditionalGeneration` | MiniMax Music 3 (text-to-music) | `MiniMaxAI/MiniMax-Music3` | ✅︎ | | | | — |
 | `Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-CustomVoice | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | ✅︎ | | | | [Published](https://recipes.vllm.ai/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) |
@@ -111,6 +109,7 @@ th {
 | `ErnieImagePipeline` | ERNIE-Image | `baidu/ERNIE-Image`, `baidu/ERNIE-Image-Turbo` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `GepardTalkerForConditionalGeneration` | Gepard-1.0 | `nineninesix/gepard-1.0` | ✅︎ | | | | — |
 |`HiDreamImagePipeline` | HiDream-I1-Full | `HiDream-ai/HiDream-I1-Full` | ✅︎ | ✅︎ | | | — |
+| `HiDreamO1ImagePipeline` | HiDream-O1-Image | `HiDream-ai/HiDream-O1-Image` | ✅︎ | | | | — |
 
 The `Recipe` column links the corresponding deployment recipe. `Published` is
 preferred when a corresponding `recipes.vllm.ai` page exists; otherwise the
