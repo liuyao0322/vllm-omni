@@ -1,5 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import math
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import numpy as np
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
@@ -8,7 +11,7 @@ _MAX_EMBEDDING_DIM = 8192
 
 SUPPORTED_AUDIO_FORMATS: frozenset[str] = frozenset({"wav", "pcm", "flac", "mp3", "opus"})
 SUPPORTED_CHAT_AUDIO_FORMATS: frozenset[str] = SUPPORTED_AUDIO_FORMATS | {"pcm16"}
-DEFAULT_AUDIO_FORMAT: str = "wav"
+DEFAULT_AUDIO_FORMAT: Literal["wav", "pcm", "flac", "mp3", "opus"] = "wav"
 
 
 def _normalize_ref_audio_value(value):
@@ -201,15 +204,17 @@ class OpenAICreateSpeechRequest(BaseModel):
         if not v:
             return []
         if isinstance(v[0], list):
-            for item in v:
+            nested = cast(list[list[float]], v)
+            for item in nested:
                 if not item:
                     raise ValueError("'speaker_embedding' nested vectors must be non-empty")
                 if not all(math.isfinite(x) for x in item):
                     raise ValueError("'speaker_embedding' values must be finite (no NaN or Inf)")
-            return v
-        if not all(math.isfinite(x) for x in v):
+            return nested
+        flat = cast(list[float], v)
+        if not all(math.isfinite(x) for x in flat):
             raise ValueError("'speaker_embedding' values must be finite (no NaN or Inf)")
-        return v
+        return flat
 
     @model_validator(mode="before")
     @classmethod
@@ -511,6 +516,7 @@ class StreamingSpeechSessionConfig(BaseModel):
     """Configuration sent as the first WebSocket message for streaming TTS."""
 
     model: str | None = None
+    text_input_mode: Literal["buffered", "commitment"] = "buffered"
     voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
     language: str | None = None

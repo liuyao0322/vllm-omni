@@ -1,7 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """WebSocket handler for streaming text input TTS.
 
-Accepts text incrementally via WebSocket, buffers it until input.done, and
-generates audio once for the buffered input using the existing TTS pipeline.
+In ``buffered`` mode, text is accumulated until ``input.done`` and synthesized
+as one request.  In ``commitment`` mode, supported models may synthesize
+irreversible sentence segments before EOF while an unresolved suffix remains
+buffered by the text-commitment policy.
 
 input.done is a flush, not a close: it ends the current utterance and the
 connection stays open, so the next utterance reuses the same connection
@@ -10,9 +15,10 @@ session.close, on the idle timeout, or when the client closes the socket.
 The session config is sticky across flushes and can be replaced by sending
 another session.config between utterances.
 
-"Utterance" here names the flush unit rather than any linguistic unit: it is
-whatever text the client had buffered when it sent input.done, from a word to
-several paragraphs, synthesized as a single request.
+"Utterance" here names the flush unit rather than any linguistic unit.  In
+buffered mode it maps to one synthesis request; in commitment mode it may map
+to several ordered synthesis requests, each ending at a policy-confirmed
+boundary.
 
 Protocol:
     Client -> Server:
@@ -51,16 +57,22 @@ import asyncio
 import base64
 import json
 from contextlib import aclosing
+from dataclasses import dataclass, field
 
 from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 from vllm.logger import init_logger
+from vllm.utils import random_uuid
 
 from vllm_omni.entrypoints.openai.protocol.audio import (
     OpenAICreateSpeechRequest,
     StreamingSpeechSessionConfig,
 )
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.model_executor.stage_input_processors.streaming_text_commitment import (
+    CommitmentUpdate,
+    StreamingTextCommitmentPolicy,
+)
 from vllm_omni.utils.forced_aligner import extract_word_timestamps
 
 logger = init_logger(__name__)
@@ -71,16 +83,67 @@ _PCM_SAMPLE_RATE = 24000
 _BYTES_PER_SAMPLE = 2  # 16-bit mono PCM
 _MAX_CONFIG_MESSAGE_SIZE = 4 * 1024 * 1024  # allow large ref_audio payloads
 _MAX_INPUT_TEXT_MESSAGE_SIZE = 128 * 1024
+_MAX_COMMITMENT_UTTERANCE_CHARS = 128 * 1024
+_MAX_COMMITMENT_PENDING_CHARS = 4096
+_MAX_COMMITMENT_QUEUE_SIZE = 8
+
+_UTTERANCE_EOF = object()
+
+
+class _SerializedWebSocket:
+    """Serialize ASGI writes made by the receiver and synthesis worker."""
+
+    def __init__(self, websocket: WebSocket) -> None:
+        self._websocket = websocket
+        self._send_lock = asyncio.Lock()
+
+    async def receive_text(self) -> str:
+        return await self._websocket.receive_text()
+
+    async def send_json(self, data: object) -> None:
+        async with self._send_lock:
+            await self._websocket.send_json(data)
+
+    async def send_bytes(self, data: bytes) -> None:
+        async with self._send_lock:
+            await self._websocket.send_bytes(data)
+
+    async def close(self) -> None:
+        async with self._send_lock:
+            await self._websocket.close()
+
+
+@dataclass
+class _CommitmentUtterance:
+    """Connection-local state for one incrementally committed utterance."""
+
+    index: int
+    config: StreamingSpeechSessionConfig
+    policy: StreamingTextCommitmentPolicy = field(
+        default_factory=lambda: StreamingTextCommitmentPolicy(max_pending_chars=_MAX_COMMITMENT_PENDING_CHARS)
+    )
+    queue: asyncio.Queue[str | object] = field(
+        default_factory=lambda: asyncio.Queue(maxsize=_MAX_COMMITMENT_QUEUE_SIZE)
+    )
+    segment_parts: list[str] = field(default_factory=list)
+    input_chars: int = 0
+    started_sentences: int = 0
+    failed: bool = False
+    eof: bool = False
+    cancellation_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    worker: asyncio.Task[None] | None = None
+    active_request_ids: set[str] = field(default_factory=set)
+    aborted_request_ids: set[str] = field(default_factory=set)
 
 
 class OmniStreamingSpeechHandler:
     """Handles WebSocket sessions for streaming text-input TTS.
 
-    A connection carries one or more utterances. Text arrives incrementally,
-    is buffered until input.done, and audio is generated once for the
-    buffered input using the existing OmniOpenAIServingSpeech pipeline. The
-    connection outlives each utterance so a client can keep synthesizing on
-    it without reconnecting.
+    A connection carries one or more utterances. Buffered sessions generate
+    once at input.done. Commitment sessions can generate confirmed segments
+    before input.done and flush their unresolved suffix at EOF. The connection
+    outlives each utterance so a client can keep synthesizing without
+    reconnecting.
 
     Args:
         speech_service: The existing TTS serving instance (reused for
@@ -102,25 +165,36 @@ class OmniStreamingSpeechHandler:
     async def handle_session(self, websocket: WebSocket) -> None:
         """Main loop for a single WebSocket connection.
 
-        Serves any number of utterances: text is buffered until input.done,
-        which flushes it as one TTS request and then leaves the connection
-        open for the next one. Rejecting a message is only fatal before the
-        first valid session.config; afterwards the error is reported and the
-        connection survives.
+        Serves any number of utterances. ``input.done`` flushes the current
+        utterance and leaves the connection open for the next one. Rejecting a
+        message is only fatal before the first valid session.config;
+        afterwards the error is reported and the connection survives.
         """
         await websocket.accept()
+        websocket = _SerializedWebSocket(websocket)  # type: ignore[assignment]
 
         config: StreamingSpeechSessionConfig | None = None
         text_parts: list[str] = []
         utterance_index = 0
+        commitment: _CommitmentUtterance | None = None
 
         try:
             while True:
+                # A commitment worker owns all audio/session events for its
+                # utterance. Reap it before accepting the next utterance.
+                if commitment is not None and commitment.worker is not None and commitment.worker.done():
+                    await commitment.worker
+                    commitment = None
+
                 try:
-                    raw = await asyncio.wait_for(
-                        websocket.receive_text(),
+                    raw, worker_finished = await self._receive_text(
+                        websocket,
                         timeout=self._config_timeout if config is None else self._idle_timeout,
+                        draining=commitment,
                     )
+                    if worker_finished:
+                        commitment = None
+                        continue
                 except asyncio.TimeoutError:
                     if config is None:
                         await self._send_error(websocket, "Timeout waiting for session.config")
@@ -137,10 +211,16 @@ class OmniStreamingSpeechHandler:
                 msg_type = msg.get("type")
 
                 if msg_type == "session.config":
-                    if text_parts:
+                    if text_parts or commitment is not None:
+                        message = (
+                            "session.config cannot be applied while input is buffered; send input.done first"
+                            if text_parts
+                            else "session.config cannot be applied while an utterance is active; "
+                            "wait for session.done first"
+                        )
                         await self._send_error(
                             websocket,
-                            "session.config cannot be applied while input is buffered; send input.done first",
+                            message,
                         )
                         continue
                     new_config = await self._build_config(websocket, msg)
@@ -162,9 +242,44 @@ class OmniStreamingSpeechHandler:
                     if not isinstance(text, str):
                         await self._send_error(websocket, "input.text requires a string value")
                         continue
-                    text_parts.append(text)
+                    if config.text_input_mode == "buffered":
+                        text_parts.append(text)
+                    else:
+                        if commitment is not None and commitment.eof:
+                            await self._send_error(
+                                websocket,
+                                "Previous utterance is still active; wait for session.done",
+                            )
+                            continue
+                        if commitment is None:
+                            commitment = self._start_commitment_utterance(
+                                websocket,
+                                config,
+                                utterance_index,
+                            )
+                        await self._feed_commitment_text(websocket, commitment, text)
 
                 elif msg_type == "input.done":
+                    if config.text_input_mode == "commitment":
+                        if commitment is not None and commitment.eof:
+                            await self._send_error(
+                                websocket,
+                                "input.done overlaps an utterance that is still active; wait for session.done",
+                            )
+                            continue
+                        if commitment is None:
+                            await websocket.send_json(
+                                {
+                                    "type": "session.done",
+                                    "utterance_index": utterance_index,
+                                    "total_sentences": 0,
+                                }
+                            )
+                        else:
+                            await self._finish_commitment_utterance(commitment)
+                        utterance_index += 1
+                        continue
+
                     full_text = "".join(text_parts).strip()
                     text_parts.clear()
                     total_sentences = 0
@@ -190,6 +305,8 @@ class OmniStreamingSpeechHandler:
                     utterance_index += 1
 
                 elif msg_type == "session.close":
+                    await self._cleanup_commitment_utterance(commitment)
+                    commitment = None
                     await websocket.close()
                     return
 
@@ -207,6 +324,223 @@ class OmniStreamingSpeechHandler:
                 await self._send_error(websocket, f"Internal error: {e}")
             except Exception:
                 logger.debug("Failed to send error to streaming speech client", exc_info=True)
+        finally:
+            await self._cleanup_commitment_utterance(commitment)
+
+    async def _receive_text(
+        self,
+        websocket: WebSocket,
+        *,
+        timeout: float,
+        draining: _CommitmentUtterance | None,
+    ) -> tuple[str, bool]:
+        """Receive input while noticing an EOF worker completing.
+
+        During commitment drain the client must still be able to close the
+        connection, and overlapping input must be rejected instead of being
+        silently reinterpreted as the next utterance. The drain time itself is
+        generation time, not client idle time; the idle clock restarts once the
+        worker emits ``session.done``.
+        """
+        if draining is None or not draining.eof or draining.worker is None:
+            return await asyncio.wait_for(websocket.receive_text(), timeout=timeout), False
+
+        receive_task = asyncio.create_task(websocket.receive_text())
+        done, _ = await asyncio.wait(
+            {receive_task, draining.worker},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if receive_task in done:
+            return receive_task.result(), False
+
+        receive_task.cancel()
+        await asyncio.gather(receive_task, return_exceptions=True)
+        await draining.worker
+        return "", True
+
+    def _start_commitment_utterance(
+        self,
+        websocket: WebSocket,
+        config: StreamingSpeechSessionConfig,
+        utterance_index: int,
+    ) -> _CommitmentUtterance:
+        state = _CommitmentUtterance(index=utterance_index, config=config)
+        state.worker = asyncio.create_task(self._commitment_worker(websocket, state))
+        return state
+
+    async def _feed_commitment_text(
+        self,
+        websocket: WebSocket,
+        state: _CommitmentUtterance,
+        text: str,
+    ) -> None:
+        if state.failed:
+            await self._send_error(
+                websocket,
+                "input.text rejected: the current utterance has failed; send input.done",
+            )
+            return
+
+        state.input_chars += len(text)
+        if state.input_chars > _MAX_COMMITMENT_UTTERANCE_CHARS:
+            await self._fail_commitment_input(
+                websocket,
+                state,
+                f"Commitment utterance exceeds {_MAX_COMMITMENT_UTTERANCE_CHARS} characters",
+            )
+            return
+
+        try:
+            update = state.policy.feed(text)
+        except ValueError as exc:
+            await self._fail_commitment_input(websocket, state, str(exc))
+            return
+        await self._enqueue_commitment_update(state, update)
+
+    async def _finish_commitment_utterance(self, state: _CommitmentUtterance) -> None:
+        if state.eof:
+            return
+        state.eof = True
+        if not state.failed:
+            try:
+                await self._enqueue_commitment_update(state, state.policy.finish())
+                await self._enqueue_commitment_segment(state)
+            except ValueError:
+                # The pending-size failure is reported by feed(), before EOF;
+                # this is defensive for a custom policy/normalizer failure.
+                state.failed = True
+                self._drop_queued_segments(state)
+        await state.queue.put(_UTTERANCE_EOF)
+
+    async def _enqueue_commitment_update(
+        self,
+        state: _CommitmentUtterance,
+        update: CommitmentUpdate,
+    ) -> None:
+        """Segment only on boundaries already decided by the policy.
+
+        In particular, this layer never scans punctuation again. That would
+        recreate packet-seam ambiguity for decimal points and abbreviations.
+        """
+        for span in update.spans:
+            state.segment_parts.append(span.source_text)
+            if span.boundary_after:
+                await self._enqueue_commitment_segment(state)
+
+    async def _enqueue_commitment_segment(self, state: _CommitmentUtterance) -> None:
+        sentence = "".join(state.segment_parts)
+        state.segment_parts.clear()
+        if sentence.strip() and not state.failed:
+            # Awaiting a full queue deliberately backpressures receive_text.
+            await state.queue.put(sentence)
+
+    async def _fail_commitment_input(
+        self,
+        websocket: WebSocket,
+        state: _CommitmentUtterance,
+        message: str,
+    ) -> None:
+        if state.failed:
+            return
+        state.failed = True
+        state.segment_parts.clear()
+        self._drop_queued_segments(state)
+        await self._send_error(websocket, message)
+
+    @staticmethod
+    def _drop_queued_segments(state: _CommitmentUtterance) -> None:
+        while True:
+            try:
+                state.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+
+    async def _commitment_worker(
+        self,
+        websocket: WebSocket,
+        state: _CommitmentUtterance,
+    ) -> None:
+        sentence_index = 0
+        try:
+            while True:
+                item = await state.queue.get()
+                if item is _UTTERANCE_EOF:
+                    break
+                if state.failed:
+                    continue
+
+                sentence_text = str(item)
+                # Every count corresponds to an audio.start. Preconditions
+                # which reject before audio.start therefore do not increment.
+                precondition_error = self._generation_precondition_error(state.config)
+                if precondition_error is not None:
+                    await self._send_error(websocket, precondition_error)
+                    state.failed = True
+                    self._drop_queued_segments(state)
+                    if state.eof:
+                        break
+                    continue
+
+                state.started_sentences += 1
+                succeeded = await self._generate_and_send(
+                    websocket,
+                    state.config,
+                    sentence_text,
+                    utterance_index=state.index,
+                    sentence_index=sentence_index,
+                    active_request_ids=state.active_request_ids,
+                    aborted_request_ids=state.aborted_request_ids,
+                    suppress_done_on_cancel=True,
+                    cancellation_event=state.cancellation_event,
+                )
+                sentence_index += 1
+                if not succeeded:
+                    state.failed = True
+                    self._drop_queued_segments(state)
+                    if state.eof:
+                        break
+        finally:
+            if state.eof and not state.cancellation_event.is_set():
+                try:
+                    await websocket.send_json(
+                        {
+                            "type": "session.done",
+                            "utterance_index": state.index,
+                            "total_sentences": state.started_sentences,
+                        }
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to send session.done for utterance %d",
+                        state.index,
+                        exc_info=True,
+                    )
+
+    async def _cleanup_commitment_utterance(
+        self,
+        state: _CommitmentUtterance | None,
+    ) -> None:
+        if state is None:
+            return
+        state.cancellation_event.set()
+        request_ids = tuple(state.active_request_ids)
+        if state.worker is not None and not state.worker.done():
+            # Mark and cancel first so an abort-induced generator exception
+            # cannot race out terminal events after session.close/disconnect.
+            state.worker.cancel()
+        for request_id in request_ids:
+            await self._abort_request_once(request_id, state.aborted_request_ids)
+        if state.worker is not None:
+            await asyncio.gather(state.worker, return_exceptions=True)
+
+    async def _abort_request_once(self, request_id: str, aborted: set[str]) -> None:
+        if request_id in aborted:
+            return
+        aborted.add(request_id)
+        try:
+            await self._speech_service.engine_client.abort(request_id)
+        except Exception:
+            logger.debug("Failed to abort streaming speech request %s", request_id, exc_info=True)
 
     async def _parse_message(self, websocket: WebSocket, raw: str) -> dict | None:
         """Decode one client message, or report why it was rejected.
@@ -252,7 +586,44 @@ class OmniStreamingSpeechHandler:
                 await self._send_error(websocket, str(error))
                 return None
 
+        if config.text_input_mode == "commitment":
+            adapter = self._speech_service._get_tts_adapter()
+            supported_modes = adapter.supported_text_input_modes if adapter is not None else frozenset({"buffered"})
+            if "commitment" not in supported_modes:
+                await self._send_error(
+                    websocket,
+                    "text_input_mode='commitment' is not supported by the configured TTS model",
+                )
+                return None
+            if not isinstance(config.language, str) or config.language.casefold() not in {
+                "chinese",
+                "english",
+            }:
+                await self._send_error(
+                    websocket,
+                    "text_input_mode='commitment' requires language='Chinese' or language='English'",
+                )
+                return None
+
         return config
+
+    def _generation_precondition_error(self, config: StreamingSpeechSessionConfig) -> str | None:
+        if not config.word_timestamps:
+            return None
+        if not self._speech_service.forced_aligner_enabled:
+            return (
+                "word_timestamps=true but the server was launched without "
+                "--forced-aligner; either restart the server with that flag "
+                "or set word_timestamps=false in session.config."
+            )
+        response_format = config.response_format or "wav"
+        if not (config.stream_audio and response_format == "pcm"):
+            return (
+                "word_timestamps=true requires stream_audio=true and "
+                "response_format='pcm' (timestamps ride the per-sentence "
+                "PCM audio.chunk stream)."
+            )
+        return None
 
     async def _generate_and_send(
         self,
@@ -262,7 +633,11 @@ class OmniStreamingSpeechHandler:
         *,
         utterance_index: int,
         sentence_index: int,
-    ) -> None:
+        active_request_ids: set[str] | None = None,
+        aborted_request_ids: set[str] | None = None,
+        suppress_done_on_cancel: bool = False,
+        cancellation_event: asyncio.Event | None = None,
+    ) -> bool:
         """Generate audio for a single sentence and send it over WebSocket.
 
         ``utterance_index`` identifies the flush this sentence belongs to and
@@ -271,23 +646,10 @@ class OmniStreamingSpeechHandler:
         response_format = config.response_format or "wav"
 
         # Reject unmet word-timestamps preconditions early with a clear reason.
-        if config.word_timestamps:
-            if not self._speech_service.forced_aligner_enabled:
-                await self._send_error(
-                    websocket,
-                    "word_timestamps=true but the server was launched without "
-                    "--forced-aligner; either restart the server with that flag "
-                    "or set word_timestamps=false in session.config.",
-                )
-                return
-            if not (config.stream_audio and response_format == "pcm"):
-                await self._send_error(
-                    websocket,
-                    "word_timestamps=true requires stream_audio=true and "
-                    "response_format='pcm' (timestamps ride the per-sentence "
-                    "PCM audio.chunk stream).",
-                )
-                return
+        precondition_error = self._generation_precondition_error(config)
+        if precondition_error is not None:
+            await self._send_error(websocket, precondition_error)
+            return False
 
         request = OpenAICreateSpeechRequest(
             input=sentence_text,
@@ -326,10 +688,21 @@ class OmniStreamingSpeechHandler:
 
         total_bytes = 0
         generation_failed = False
-        request_id = None
+        generation_cancelled = False
+        request_id = f"speech-stream-{random_uuid()}"
+        if active_request_ids is not None:
+            active_request_ids.add(request_id)
         try:
             if config.stream_audio:
-                request_id, generator, _ = await self._speech_service._prepare_speech_generation(request)
+                prepared_request_id, generator, _ = await self._speech_service._prepare_speech_generation(
+                    request,
+                    request_id=request_id,
+                )
+                if prepared_request_id != request_id:
+                    if active_request_ids is not None:
+                        active_request_ids.discard(request_id)
+                        active_request_ids.add(prepared_request_id)
+                    request_id = prepared_request_id
                 if config.word_timestamps:
                     total_bytes = await self._stream_audio_with_alignments(
                         websocket=websocket,
@@ -346,41 +719,55 @@ class OmniStreamingSpeechHandler:
                             total_bytes += len(chunk)
                             await websocket.send_bytes(chunk)
             else:
-                audio_bytes, _ = await self._speech_service._generate_audio_bytes(request)
+                audio_bytes, _ = await self._speech_service._generate_audio_bytes(
+                    request,
+                    request_id=request_id,
+                )
                 total_bytes = len(audio_bytes)
                 await websocket.send_bytes(audio_bytes)
         except WebSocketDisconnect:
             if request_id is not None:
-                try:
-                    await self._speech_service.engine_client.abort(request_id)
-                except Exception:
-                    logger.debug("Failed to abort streaming speech request %s", request_id, exc_info=True)
+                await self._abort_request_once(
+                    request_id,
+                    aborted_request_ids if aborted_request_ids is not None else set(),
+                )
+            raise
+        except asyncio.CancelledError:
+            generation_cancelled = True
             raise
         except Exception as e:
-            generation_failed = True
-            logger.error(
-                "Generation failed for utterance %d, sentence %d: %s",
-                utterance_index,
-                sentence_index,
-                e,
-            )
-            await self._send_error(
-                websocket,
-                f"Generation failed for utterance {utterance_index}, sentence {sentence_index}: {e}",
-            )
-        finally:
-            try:
-                await websocket.send_json(
-                    {
-                        "type": "audio.done",
-                        "utterance_index": utterance_index,
-                        "sentence_index": sentence_index,
-                        "total_bytes": total_bytes,
-                        "error": generation_failed,
-                    }
+            if cancellation_event is not None and cancellation_event.is_set():
+                generation_cancelled = True
+            else:
+                generation_failed = True
+                logger.error(
+                    "Generation failed for utterance %d, sentence %d: %s",
+                    utterance_index,
+                    sentence_index,
+                    e,
                 )
+                await self._send_error(
+                    websocket,
+                    f"Generation failed for utterance {utterance_index}, sentence {sentence_index}: {e}",
+                )
+        finally:
+            if request_id is not None and active_request_ids is not None:
+                active_request_ids.discard(request_id)
+            try:
+                cancellation_requested = cancellation_event is not None and cancellation_event.is_set()
+                if not (suppress_done_on_cancel and (generation_cancelled or cancellation_requested)):
+                    await websocket.send_json(
+                        {
+                            "type": "audio.done",
+                            "utterance_index": utterance_index,
+                            "sentence_index": sentence_index,
+                            "total_bytes": total_bytes,
+                            "error": generation_failed,
+                        }
+                    )
             except Exception:
                 logger.debug("Failed to send audio.done for sentence %d", sentence_index, exc_info=True)
+        return not generation_failed and not generation_cancelled
 
     async def _stream_audio_with_alignments(
         self,
