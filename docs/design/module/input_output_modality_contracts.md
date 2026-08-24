@@ -128,7 +128,9 @@ invariants are:
   source received so far;
 - only a suffix may remain pending, and the committed prefix grows
   monotonically;
-- committed source is independent of transport packet seams; and
+- committed source is independent of transport packet seams;
+- a consecutive strong-terminator run creates one boundary only after its end
+  is confirmed by following non-terminator input or end-of-input; and
 - a policy boundary ends the raw segment assembled since the preceding
   boundary so it can be submitted as an independent, immutable request. It is
   not a general sentence-boundary or prosody prediction.
@@ -150,15 +152,18 @@ was observed. A transport update arriving after completion MUST be rejected.
 If the pending suffix exceeds its configured safety limit, the utterance MUST
 fail instead of releasing text whose reading is still unresolved.
 
-M1 applies backpressure with a bounded queue between readiness decisions and
-independent TTS requests. A producer MUST wait when that queue is full; it MUST
-NOT drop, merge, reorder, or speculatively release spans to make space. A
-segment failure fails the current utterance, prevents later queued segments
-from starting, and reports the terminal request error. Client disconnect and
-`session.close` cancel active work and discard unsubmitted text. `session.done`
-denotes an explicit end-of-input boundary, not successful synthesis: it is
-emitted after EOF also for a failed utterance, but not after disconnect or
-`session.close` cancellation.
+M1 applies backpressure with a bounded queue in front of independent TTS
+requests. An independent segment producer MUST wait when that queue is full,
+while transport reception MUST remain available for control frames. Committed
+segments may be staged ahead of that producer in source order; their memory is
+bounded by the utterance character limit. The producer MUST NOT drop, merge,
+reorder, or speculatively release spans to make space. A segment failure fails
+the current utterance, prevents later queued segments from starting, and
+reports the terminal request error. Client disconnect and `session.close`
+cancel active work and discard unsubmitted text. `session.done` denotes an
+explicit end-of-input boundary, not successful synthesis: it is emitted after
+EOF also for a failed utterance, but not after disconnect or `session.close`
+cancellation.
 
 The transport idle budget MUST NOT cancel queued or in-flight committed
 synthesis. Generation time pauses that budget, and a fresh idle window starts

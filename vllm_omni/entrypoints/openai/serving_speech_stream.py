@@ -122,6 +122,11 @@ class _CommitmentUtterance:
     policy: StreamingTextCommitmentPolicy = field(
         default_factory=lambda: StreamingTextCommitmentPolicy(max_pending_chars=_MAX_COMMITMENT_PENDING_CHARS)
     )
+    # Policy updates are staged here without awaiting so bounded synthesis
+    # backpressure never blocks the sole WebSocket receive loop. The existing
+    # utterance character limit bounds the total memory retained by this
+    # otherwise unbounded ingress queue.
+    ingress: asyncio.Queue[str | object] = field(default_factory=asyncio.Queue)
     queue: asyncio.Queue[str | object] = field(
         default_factory=lambda: asyncio.Queue(maxsize=_MAX_COMMITMENT_QUEUE_SIZE)
     )
@@ -130,7 +135,13 @@ class _CommitmentUtterance:
     started_sentences: int = 0
     failed: bool = False
     eof: bool = False
+    producer_forwarded_eof: bool = False
+    consumer_observed_eof: bool = False
     cancellation_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    producer: asyncio.Task[None] | None = None
+    consumer: asyncio.Task[None] | None = None
+    # ``worker`` owns the complete producer/consumer lifecycle and is the
+    # authoritative completion signal observed by the receive loop.
     worker: asyncio.Task[None] | None = None
     active_request_ids: set[str] = field(default_factory=set)
     aborted_request_ids: set[str] = field(default_factory=set)
@@ -275,7 +286,7 @@ class OmniStreamingSpeechHandler:
                                 }
                             )
                         else:
-                            await self._finish_commitment_utterance(commitment)
+                            self._finish_commitment_utterance(commitment)
                         utterance_index += 1
                         continue
 
@@ -336,8 +347,8 @@ class OmniStreamingSpeechHandler:
         """Receive input while accounting for committed server work.
 
         Committed synthesis time is server work, not client idle time. Before
-        EOF, ``queue.join()`` covers every queued or in-flight segment. After
-        EOF, the worker itself is authoritative because it emits
+        EOF, both queue joins cover every staged, queued, or in-flight segment.
+        After EOF, the worker itself is authoritative because it emits
         ``session.done``. The same receive task survives both transitions so a
         message arriving exactly as work settles cannot be lost.
         """
@@ -350,7 +361,7 @@ class OmniStreamingSpeechHandler:
             if commitment.eof:
                 server_work: asyncio.Task[None] = commitment.worker
             else:
-                join_task = asyncio.create_task(commitment.queue.join())
+                join_task = asyncio.create_task(self._wait_for_commitment_work(commitment))
                 server_work = join_task
 
             # Always notice an unexpectedly terminated worker as well as the
@@ -385,6 +396,18 @@ class OmniStreamingSpeechHandler:
                     task.cancel()
             await asyncio.gather(*helper_tasks, return_exceptions=True)
 
+    @staticmethod
+    async def _wait_for_commitment_work(state: _CommitmentUtterance) -> None:
+        """Wait until all staged and accepted synthesis work has settled.
+
+        The producer accounts for an ingress item only after either staging it
+        in the bounded synthesis queue or intentionally skipping it after an
+        utterance failure. Consequently, waiting ingress first and synthesis
+        second has no transient gap in which active work looks idle.
+        """
+        await state.ingress.join()
+        await state.queue.join()
+
     def _start_commitment_utterance(
         self,
         websocket: WebSocket,
@@ -392,7 +415,9 @@ class OmniStreamingSpeechHandler:
         utterance_index: int,
     ) -> _CommitmentUtterance:
         state = _CommitmentUtterance(index=utterance_index, config=config)
-        state.worker = asyncio.create_task(self._commitment_worker(websocket, state))
+        state.producer = asyncio.create_task(self._commitment_segment_producer(state))
+        state.consumer = asyncio.create_task(self._commitment_worker(websocket, state))
+        state.worker = asyncio.create_task(self._commitment_lifecycle(websocket, state))
         return state
 
     async def _feed_commitment_text(
@@ -422,24 +447,24 @@ class OmniStreamingSpeechHandler:
         except ValueError as exc:
             await self._fail_commitment_input(websocket, state, str(exc))
             return
-        await self._enqueue_commitment_update(state, update)
+        self._enqueue_commitment_update(state, update)
 
-    async def _finish_commitment_utterance(self, state: _CommitmentUtterance) -> None:
+    def _finish_commitment_utterance(self, state: _CommitmentUtterance) -> None:
         if state.eof:
             return
         state.eof = True
         if not state.failed:
             try:
-                await self._enqueue_commitment_update(state, state.policy.finish())
-                await self._enqueue_commitment_segment(state)
+                self._enqueue_commitment_update(state, state.policy.finish())
+                self._enqueue_commitment_segment(state)
             except ValueError:
                 # The pending-size failure is reported by feed(), before EOF;
                 # this is defensive for a custom policy/normalizer failure.
                 state.failed = True
                 self._drop_queued_segments(state)
-        await state.queue.put(_UTTERANCE_EOF)
+        state.ingress.put_nowait(_UTTERANCE_EOF)
 
-    async def _enqueue_commitment_update(
+    def _enqueue_commitment_update(
         self,
         state: _CommitmentUtterance,
         update: CommitmentUpdate,
@@ -452,14 +477,16 @@ class OmniStreamingSpeechHandler:
         for span in update.spans:
             state.segment_parts.append(span.source_text)
             if span.boundary_after:
-                await self._enqueue_commitment_segment(state)
+                self._enqueue_commitment_segment(state)
 
-    async def _enqueue_commitment_segment(self, state: _CommitmentUtterance) -> None:
+    @staticmethod
+    def _enqueue_commitment_segment(state: _CommitmentUtterance) -> None:
         sentence = "".join(state.segment_parts)
         state.segment_parts.clear()
         if sentence.strip() and not state.failed:
-            # Awaiting a full queue deliberately backpressures receive_text.
-            await state.queue.put(sentence)
+            # The independent producer absorbs bounded-queue backpressure so
+            # control frames remain readable by the transport receive loop.
+            state.ingress.put_nowait(sentence)
 
     async def _fail_commitment_input(
         self,
@@ -475,16 +502,110 @@ class OmniStreamingSpeechHandler:
         await self._send_error(websocket, message)
 
     @staticmethod
-    def _drop_queued_segments(state: _CommitmentUtterance) -> None:
+    def _drain_commitment_queue(
+        queue: asyncio.Queue[str | object],
+        *,
+        preserve_eof: bool,
+    ) -> None:
+        saw_eof = False
         while True:
             try:
-                state.queue.get_nowait()
+                item = queue.get_nowait()
             except asyncio.QueueEmpty:
-                return
+                break
             else:
                 # Every successful put contributes to queue.join(), including
-                # an EOF marker which may be discarded on a failure path.
-                state.queue.task_done()
+                # an EOF marker removed and restored on a failure path.
+                saw_eof = saw_eof or item is _UTTERANCE_EOF
+                queue.task_done()
+        if preserve_eof and saw_eof:
+            queue.put_nowait(_UTTERANCE_EOF)
+
+    @classmethod
+    def _drop_queued_segments(
+        cls,
+        state: _CommitmentUtterance,
+        *,
+        preserve_eof: bool = True,
+    ) -> None:
+        # Keep a discovered EOF in its original queue. The producer may have
+        # already finished after forwarding it to the bounded queue.
+        cls._drain_commitment_queue(state.ingress, preserve_eof=preserve_eof)
+        cls._drain_commitment_queue(state.queue, preserve_eof=preserve_eof)
+
+    @staticmethod
+    async def _commitment_segment_producer(state: _CommitmentUtterance) -> None:
+        """Transfer committed segments into the bounded synthesis queue."""
+        while True:
+            item = await state.ingress.get()
+            try:
+                if item is _UTTERANCE_EOF:
+                    await state.queue.put(item)
+                    state.producer_forwarded_eof = True
+                    return
+                if not state.failed:
+                    await state.queue.put(item)
+            finally:
+                # For ordinary work this happens only after the target put has
+                # incremented its unfinished count, preserving idle accounting.
+                state.ingress.task_done()
+
+    async def _commitment_lifecycle(
+        self,
+        websocket: WebSocket,
+        state: _CommitmentUtterance,
+    ) -> None:
+        """Observe both commitment tasks and emit terminal success once."""
+        assert state.producer is not None
+        assert state.consumer is not None
+        children = {state.producer, state.consumer}
+        try:
+            done, pending = await asyncio.wait(children, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                await task  # Propagate child exceptions immediately.
+
+            if state.consumer in done and not state.consumer_observed_eof:
+                raise RuntimeError("Commitment synthesis consumer exited before observing EOF")
+            if state.producer in done and not state.producer_forwarded_eof:
+                role = "segment producer"
+                raise RuntimeError(f"Commitment {role} exited before input.done")
+
+            # Normal EOF lets either child finish first: the producer has
+            # forwarded EOF, and the consumer exits only after receiving it.
+            if pending:
+                await asyncio.gather(*pending)
+            if not state.producer_forwarded_eof or not state.consumer_observed_eof:
+                raise RuntimeError("Commitment tasks exited without completing the EOF handoff")
+        except Exception:
+            # For an internal child failure, snapshot request IDs before
+            # cancelling its sibling so generation cleanup cannot erase the
+            # IDs needed for an engine abort. External cancellation is owned
+            # by _cleanup_commitment_utterance and bypasses this block.
+            state.cancellation_event.set()
+            request_ids = tuple(state.active_request_ids)
+            for task in children:
+                if not task.done():
+                    task.cancel()
+            for request_id in request_ids:
+                await self._abort_request_once(request_id, state.aborted_request_ids)
+            await asyncio.gather(*children, return_exceptions=True)
+            raise
+
+        if state.eof and not state.cancellation_event.is_set():
+            try:
+                await websocket.send_json(
+                    {
+                        "type": "session.done",
+                        "utterance_index": state.index,
+                        "total_sentences": state.started_sentences,
+                    }
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to send session.done for utterance %d",
+                    state.index,
+                    exc_info=True,
+                )
 
     async def _commitment_worker(
         self,
@@ -492,63 +613,43 @@ class OmniStreamingSpeechHandler:
         state: _CommitmentUtterance,
     ) -> None:
         sentence_index = 0
-        try:
-            while True:
-                item = await state.queue.get()
-                try:
-                    if item is _UTTERANCE_EOF:
-                        break
-                    if state.failed:
-                        continue
+        while True:
+            item = await state.queue.get()
+            try:
+                if item is _UTTERANCE_EOF:
+                    state.consumer_observed_eof = True
+                    return
+                if state.failed:
+                    continue
 
-                    sentence_text = str(item)
-                    # Every count corresponds to an audio.start. Preconditions
-                    # which reject before audio.start therefore do not increment.
-                    precondition_error = self._generation_precondition_error(state.config)
-                    if precondition_error is not None:
-                        await self._send_error(websocket, precondition_error)
-                        state.failed = True
-                        self._drop_queued_segments(state)
-                        if state.eof:
-                            break
-                        continue
+                sentence_text = str(item)
+                # Every count corresponds to an audio.start. Preconditions
+                # which reject before audio.start therefore do not increment.
+                precondition_error = self._generation_precondition_error(state.config)
+                if precondition_error is not None:
+                    await self._send_error(websocket, precondition_error)
+                    state.failed = True
+                    self._drop_queued_segments(state)
+                    continue
 
-                    state.started_sentences += 1
-                    succeeded = await self._generate_and_send(
-                        websocket,
-                        state.config,
-                        sentence_text,
-                        utterance_index=state.index,
-                        sentence_index=sentence_index,
-                        active_request_ids=state.active_request_ids,
-                        aborted_request_ids=state.aborted_request_ids,
-                        suppress_done_on_cancel=True,
-                        cancellation_event=state.cancellation_event,
-                    )
-                    sentence_index += 1
-                    if not succeeded:
-                        state.failed = True
-                        self._drop_queued_segments(state)
-                        if state.eof:
-                            break
-                finally:
-                    state.queue.task_done()
-        finally:
-            if state.eof and not state.cancellation_event.is_set():
-                try:
-                    await websocket.send_json(
-                        {
-                            "type": "session.done",
-                            "utterance_index": state.index,
-                            "total_sentences": state.started_sentences,
-                        }
-                    )
-                except Exception:
-                    logger.debug(
-                        "Failed to send session.done for utterance %d",
-                        state.index,
-                        exc_info=True,
-                    )
+                state.started_sentences += 1
+                succeeded = await self._generate_and_send(
+                    websocket,
+                    state.config,
+                    sentence_text,
+                    utterance_index=state.index,
+                    sentence_index=sentence_index,
+                    active_request_ids=state.active_request_ids,
+                    aborted_request_ids=state.aborted_request_ids,
+                    suppress_done_on_cancel=True,
+                    cancellation_event=state.cancellation_event,
+                )
+                sentence_index += 1
+                if not succeeded:
+                    state.failed = True
+                    self._drop_queued_segments(state)
+            finally:
+                state.queue.task_done()
 
     async def _cleanup_commitment_utterance(
         self,
@@ -558,17 +659,19 @@ class OmniStreamingSpeechHandler:
             return
         state.cancellation_event.set()
         request_ids = tuple(state.active_request_ids)
-        if state.worker is not None and not state.worker.done():
-            # Mark and cancel first so an abort-induced generator exception
-            # cannot race out terminal events after session.close/disconnect.
-            state.worker.cancel()
+        tasks = tuple(task for task in (state.worker, state.producer, state.consumer) if task is not None)
+        for task in tasks:
+            if not task.done():
+                # Mark and cancel first so an abort-induced generator
+                # exception cannot race out terminal events after close.
+                task.cancel()
         for request_id in request_ids:
             await self._abort_request_once(request_id, state.aborted_request_ids)
-        if state.worker is not None:
-            await asyncio.gather(state.worker, return_exceptions=True)
-        # The worker accounts for an item it already owns in its per-item
-        # finally block. Drain leftovers only after it has stopped consuming.
-        self._drop_queued_segments(state)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        # The producer and consumer account for items they already own in
+        # their finally blocks. Drain leftovers only after both have stopped.
+        self._drop_queued_segments(state, preserve_eof=False)
 
     async def _abort_request_once(self, request_id: str, aborted: set[str]) -> None:
         if request_id in aborted:

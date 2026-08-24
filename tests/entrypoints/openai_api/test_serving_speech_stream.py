@@ -184,8 +184,42 @@ class TestStreamingSpeechWebSocket:
         ]
         assert all("request_id" in call.kwargs for call in speech_service._generate_audio_bytes.await_args_list)
 
+    def test_commitment_keeps_decimals_and_terminator_runs_in_one_request(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(mocker=mocker, commitment_supported=True)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "language": "English",
+                        "text_input_mode": "commitment",
+                    }
+                )
+                ws.send_json({"type": "input.text", "text": ".5 seconds. Wait... What?! "})
+                ws.send_json({"type": "input.done"})
+
+                for expected_text in (".5 seconds.", " Wait...", " What?!"):
+                    start = ws.receive_json()
+                    assert start["type"] == "audio.start"
+                    assert start["sentence_text"] == expected_text
+                    ws.receive_bytes()
+                    assert ws.receive_json()["type"] == "audio.done"
+
+                assert ws.receive_json() == {
+                    "type": "session.done",
+                    "utterance_index": 0,
+                    "total_sentences": 3,
+                }
+
+        assert [call.args[0].input for call in speech_service._generate_audio_bytes.await_args_list] == [
+            ".5 seconds.",
+            " Wait...",
+            " What?!",
+        ]
+
     @pytest.mark.asyncio
-    async def test_commitment_queue_backpressures_the_receiver(self, mocker: MockerFixture):
+    async def test_commitment_queue_backpressures_segment_producer(self, mocker: MockerFixture):
         handler = OmniStreamingSpeechHandler(speech_service=mocker.MagicMock())
         state = streaming_speech_module._CommitmentUtterance(
             index=0,
@@ -194,14 +228,137 @@ class TestStreamingSpeechWebSocket:
         )
         state.queue.put_nowait("first")
         state.segment_parts.append("second!")
+        handler._enqueue_commitment_segment(state)
 
-        enqueue = asyncio.create_task(handler._enqueue_commitment_segment(state))
+        producer = asyncio.create_task(handler._commitment_segment_producer(state))
         await asyncio.sleep(0)
-        assert not enqueue.done()
+        assert not producer.done()
 
         assert state.queue.get_nowait() == "first"
-        await asyncio.wait_for(enqueue, timeout=1)
-        assert state.queue.get_nowait() == "second!"
+        state.queue.task_done()
+        assert await asyncio.wait_for(state.queue.get(), timeout=1) == "second!"
+        state.queue.task_done()
+
+        state.ingress.put_nowait(streaming_speech_module._UTTERANCE_EOF)
+        await asyncio.wait_for(producer, timeout=1)
+        assert state.queue.get_nowait() is streaming_speech_module._UTTERANCE_EOF
+        state.queue.task_done()
+        await asyncio.wait_for(state.ingress.join(), timeout=1)
+        await asyncio.wait_for(state.queue.join(), timeout=1)
+
+    def test_commitment_backpressure_does_not_block_session_close(self, mocker: MockerFixture):
+        generation_started = threading.Event()
+        release_generation = threading.Event()
+        abort_observed = threading.Event()
+
+        async def blocked_audio(*_args, **_kwargs):
+            generation_started.set()
+            await asyncio.to_thread(release_generation.wait)
+            return b"RIFF", "audio/wav"
+
+        async def observe_abort(*_args, **_kwargs):
+            abort_observed.set()
+
+        app, speech_service = _build_test_app(mocker=mocker, commitment_supported=True)
+        speech_service._generate_audio_bytes.side_effect = blocked_audio
+        speech_service.engine_client.abort.side_effect = observe_abort
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "language": "Chinese",
+                        "text_input_mode": "commitment",
+                    }
+                )
+                # One active request plus eight queued segments fills the
+                # bounded queue; the tenth segment blocks only the producer.
+                ws.send_json({"type": "input.text", "text": "甲！乙！丙！丁！戊！己！庚！辛！壬！癸！ "})
+                assert ws.receive_json()["type"] == "audio.start"
+                assert generation_started.wait(timeout=1)
+
+                try:
+                    ws.send_json({"type": "session.close"})
+                    assert abort_observed.wait(timeout=1)
+                finally:
+                    # Release the helper thread even if the responsiveness
+                    # assertion fails against a regressed implementation.
+                    release_generation.set()
+
+        speech_service.engine_client.abort.assert_awaited_once()
+        assert speech_service._generate_audio_bytes.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_commitment_worker_exit_releases_backpressured_producer(self, mocker: MockerFixture):
+        _, speech_service = _build_test_app(mocker=mocker, commitment_supported=True)
+        handler = OmniStreamingSpeechHandler(speech_service=speech_service)
+        worker_exited = asyncio.Event()
+        input_done_processed = asyncio.Event()
+        observed_states = []
+
+        original_finish = handler._finish_commitment_utterance
+
+        def observe_finish(state):
+            original_finish(state)
+            input_done_processed.set()
+
+        mocker.patch.object(handler, "_finish_commitment_utterance", side_effect=observe_finish)
+
+        async def exit_when_queue_full(_websocket, state):
+            observed_states.append(state)
+            while not state.queue.full():
+                await asyncio.sleep(0)
+            await input_done_processed.wait()
+            worker_exited.set()
+            # A consumer that returns unexpectedly must be treated just like
+            # one that raises; otherwise the full-queue producer never exits.
+            return
+
+        mocker.patch.object(handler, "_commitment_worker", side_effect=exit_when_queue_full)
+
+        class ProbeWebSocket:
+            def __init__(self):
+                self.frames = [
+                    '{"type":"session.config","language":"Chinese","text_input_mode":"commitment"}',
+                    '{"type":"input.text","text":"甲！乙！丙！丁！戊！己！庚！辛！壬！癸！ "}',
+                    '{"type":"input.done"}',
+                ]
+                self.never = asyncio.Event()
+                self.sent = []
+
+            async def accept(self):
+                pass
+
+            async def receive_text(self):
+                if self.frames:
+                    return self.frames.pop(0)
+                await self.never.wait()
+                raise AssertionError("unreachable")
+
+            async def send_json(self, data):
+                self.sent.append(data)
+
+            async def send_bytes(self, _data):
+                pass
+
+            async def close(self):
+                pass
+
+        websocket = ProbeWebSocket()
+        await asyncio.wait_for(handler.handle_session(websocket), timeout=1)  # type: ignore[arg-type]
+
+        assert worker_exited.is_set()
+        assert input_done_processed.is_set()
+        assert any(
+            message["type"] == "error" and "synthesis consumer exited before observing EOF" in message["message"]
+            for message in websocket.sent
+        )
+        assert len(observed_states) == 1
+        state = observed_states[0]
+        assert all(task is not None and task.done() for task in (state.producer, state.consumer, state.worker))
+        await asyncio.wait_for(state.ingress.join(), timeout=1)
+        await asyncio.wait_for(state.queue.join(), timeout=1)
 
     @pytest.mark.asyncio
     async def test_receive_keeps_pending_frame_when_committed_work_settles(self, mocker: MockerFixture):
@@ -470,7 +627,9 @@ class TestStreamingSpeechWebSocket:
                         "text_input_mode": "commitment",
                     }
                 )
-                ws.send_json({"type": "input.text", "text": "Hello!"})
+                # The following space confirms that the terminator run has
+                # ended while input remains open.
+                ws.send_json({"type": "input.text", "text": "Hello! "})
                 assert ws.receive_json()["type"] == "audio.start"
                 # Cancellation after EOF must still omit session.done.
                 ws.send_json({"type": "input.done"})
@@ -692,7 +851,9 @@ class TestStreamingSpeechWebSocket:
                         "text_input_mode": "commitment",
                     }
                 )
-                ws.send_json({"type": "input.text", "text": "Hello!"})
+                # A non-terminator after ``!`` closes the punctuation run
+                # without requiring EOF.
+                ws.send_json({"type": "input.text", "text": "Hello! "})
 
                 assert ws.receive_json() == {
                     "type": "audio.start",

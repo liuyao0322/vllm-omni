@@ -119,6 +119,17 @@ def _packetizations(text: str) -> tuple[tuple[str, ...], ...]:
     return tuple(variants)
 
 
+def _segments(trace: _Trace, source: str) -> tuple[str, ...]:
+    start = 0
+    segments = []
+    for end in trace.strong_boundaries:
+        segments.append(source[start:end])
+        start = end
+    if start < len(source):
+        segments.append(source[start:])
+    return tuple(segments)
+
+
 @pytest.mark.parametrize(
     "text",
     (
@@ -175,8 +186,9 @@ def test_digit_keycap_suffix_stays_with_the_number_across_every_seam(
     update = policy.feed(packets[2])
     assert [(span.kind, span.source_text) for span in update.spans] == [
         ("special", keycap),
-        ("natural", "继续。"),
+        ("natural", "继续"),
     ]
+    assert update.pending_text == "。"
     assert _trace(packets, finish=True) == _trace(("按" + keycap + "继续。",), finish=True)
 
 
@@ -223,8 +235,87 @@ def test_only_confirmed_strong_sentence_ends_set_boundary_metadata() -> None:
     spans = [(span.source_text, span.boundary_after) for span in update.spans]
 
     assert ("，继续。", True) in spans
-    assert ("下一句!", True) in spans
+    assert update.pending_text == "!"
+    assert ("下一句", False) in spans
     assert all(not boundary for text, boundary in spans if text == "12.5")
+    final = policy.finish()
+    assert [(span.source_text, span.boundary_after) for span in final.spans] == [("!", True)]
+
+
+@pytest.mark.parametrize("decimal", (".5 seconds.", "．５秒。"))
+def test_leading_decimal_is_one_special_atom_for_every_packetization(decimal: str) -> None:
+    baseline = _trace((decimal,), finish=True)
+
+    assert baseline.atoms[0][0] == "special"
+    assert baseline.atoms[0][1].startswith(decimal[:2])
+    assert baseline.strong_boundaries == (len(decimal),)
+    assert _segments(baseline, decimal) == (decimal,)
+    for packets in _packetizations(decimal):
+        assert _trace(packets, finish=True) == baseline
+
+
+def test_decimal_point_at_packet_frontier_stays_pending() -> None:
+    policy = StreamingTextCommitmentPolicy()
+
+    first = policy.feed("Value is .")
+    assert first.committed_text == "Value is "
+    assert first.pending_text == "."
+
+    second = policy.feed("5 seconds.")
+    assert all(span.source_text != "." for span in second.spans)
+    assert second.pending_text == ".5 seconds."
+    final = policy.finish()
+    assert second.committed_text + final.committed_text == ".5 seconds."
+
+
+def test_maximal_terminator_run_takes_precedence_over_leading_decimal() -> None:
+    text = "Wait...5 seconds."
+    baseline = _trace((text,), finish=True)
+
+    assert baseline.strong_boundaries == (len("Wait..."), len(text))
+    assert _segments(baseline, text) == ("Wait...", "5 seconds.")
+    assert all(atom[1] != ".5" for atom in baseline.atoms)
+    for packets in _packetizations(text):
+        assert _trace(packets, finish=True) == baseline
+
+
+def test_fullwidth_leading_decimal_after_terminator_remains_special() -> None:
+    text = "结束。．５秒。"
+    baseline = _trace((text,), finish=True)
+
+    assert ("special", "．５秒") in baseline.atoms
+    assert baseline.strong_boundaries == (len("结束。"), len(text))
+    for packets in _packetizations(text):
+        assert _trace(packets, finish=True) == baseline
+
+
+@pytest.mark.parametrize("text", ("Wait...", "What?!", "Really!!!"))
+def test_consecutive_terminators_form_one_boundary_for_every_packetization(text: str) -> None:
+    baseline = _trace((text,), finish=True)
+
+    assert baseline.strong_boundaries == (len(text),)
+    assert _segments(baseline, text) == (text,)
+    for packets in _packetizations(text):
+        trace = _trace(packets, finish=True)
+        assert trace == baseline
+        assert _segments(trace, text) == (text,)
+
+
+@pytest.mark.parametrize(
+    ("packets", "expected_first_segment"),
+    (
+        (("Wait.", ".. Next."), "Wait..."),
+        (("What?", "! Next."), "What?!"),
+    ),
+)
+def test_terminator_run_is_coalesced_across_packet_seam(packets: tuple[str, str], expected_first_segment: str) -> None:
+    source = "".join(packets)
+    trace = _trace(packets, finish=True)
+    segments = _segments(trace, source)
+
+    assert trace.committed_text == source
+    assert segments[0] == expected_first_segment
+    assert all(not segment or not all(ch in ".!?。！？…\n" for ch in segment.strip()) for segment in segments)
 
 
 def test_feed_final_and_finish_produce_the_same_raw_atoms() -> None:

@@ -28,6 +28,7 @@ _DIGIT_RE = re.compile(r"[0-9０-９]")
 _LEADING_SPECIAL_SYMBOLS = frozenset("$¥￥€£₽+-−—±~≈<>≤≥=×÷*/\\|@#^&_%％°℃℉")
 _BODY_SYMBOLS = frozenset("$¥￥€£₽+-−—±~≈<>≤≥=×÷*/\\|@#^&_%％°℃℉²³()[]{}（）【】_'\"")
 _AMBIGUOUS_PUNCTUATION = frozenset(".,:．，：")
+_LEADING_DECIMAL_POINTS = frozenset(".．")
 _STRONG_SENTENCE_END = frozenset(".!?。！？…\n")
 _PROFILE = "zh_en_special_v1"
 _KEYCAP_MARK = "\N{COMBINING ENCLOSING KEYCAP}"
@@ -224,6 +225,27 @@ def _is_special_start(ch: str) -> bool:
     return _is_digit(ch) or ch in _LEADING_SPECIAL_SYMBOLS
 
 
+def _is_special_start_at(text: str, index: int) -> bool:
+    """Return whether ``index`` starts a recognized special-text atom.
+
+    A decimal point followed by a digit begins a leading decimal such as
+    ``.5``.  A point at the transport frontier is retained by the natural-text
+    scanner until following input or EOF disambiguates it.
+    """
+
+    ch = text[index]
+    if _is_special_start(ch):
+        return True
+    if ch not in _LEADING_DECIMAL_POINTS:
+        return False
+    if ch in _STRONG_SENTENCE_END and index > 0 and text[index - 1] in _STRONG_SENTENCE_END:
+        # In ``Wait...5``, the last point belongs to the maximal terminator
+        # run; it must not be reclassified as the start of ``.5``.
+        return False
+    following = text[index + 1] if index + 1 < len(text) else ""
+    return _is_digit(following)
+
+
 def _unit_prefix_state(value: str) -> tuple[bool, bool]:
     """Return ``(is_complete, can_extend)`` for a case-insensitive unit."""
 
@@ -356,16 +378,45 @@ def _scan_special(text: str, start: int, *, final: bool) -> _ScanResult:
     return _ScanResult(index, index < len(text))
 
 
-def _append_natural_spans(spans: list[CommittedTextSpan], source: str) -> None:
-    """Append natural source, exposing only confirmed strong sentence ends."""
+def _append_natural_spans(
+    spans: list[CommittedTextSpan],
+    source: str,
+    *,
+    hold_trailing_terminators: bool,
+) -> str:
+    """Append natural source and return an unresolved terminator suffix.
+
+    Consecutive strong terminators are one boundary-bearing run.  A run at the
+    transport frontier stays pending because a later packet can extend ``.``
+    to ``...`` or ``?`` to ``?!``.  This avoids irreversible punctuation-only
+    segments without altering the raw source.
+    """
 
     start = 0
-    for index, ch in enumerate(source):
-        if ch in _STRONG_SENTENCE_END:
-            spans.append(CommittedTextSpan(source[start : index + 1], "natural", boundary_after=True))
-            start = index + 1
+    index = 0
+    while index < len(source):
+        if source[index] not in _STRONG_SENTENCE_END:
+            index += 1
+            continue
+
+        run_start = index
+        while index < len(source) and source[index] in _STRONG_SENTENCE_END:
+            index += 1
+        if hold_trailing_terminators and index == len(source):
+            if start < run_start:
+                spans.append(CommittedTextSpan(source[start:run_start], "natural"))
+            return source[run_start:]
+
+        spans.append(CommittedTextSpan(source[start:index], "natural", boundary_after=True))
+        start = index
+
+    if hold_trailing_terminators and source[-1:] in _LEADING_DECIMAL_POINTS:
+        if start < len(source) - 1:
+            spans.append(CommittedTextSpan(source[start:-1], "natural"))
+        return source[-1:]
     if start < len(source):
         spans.append(CommittedTextSpan(source[start:], "natural"))
+    return ""
 
 
 def _parse(text: str, *, final: bool) -> tuple[tuple[CommittedTextSpan, ...], str]:
@@ -374,11 +425,17 @@ def _parse(text: str, *, final: bool) -> tuple[tuple[CommittedTextSpan, ...], st
     while cursor < len(text):
         atom_start = cursor
         while atom_start < len(text) and not (
-            _is_lexical_start(text[atom_start]) or _is_special_start(text[atom_start])
+            _is_lexical_start(text[atom_start]) or _is_special_start_at(text, atom_start)
         ):
             atom_start += 1
         if atom_start > cursor:
-            _append_natural_spans(spans, text[cursor:atom_start])
+            pending = _append_natural_spans(
+                spans,
+                text[cursor:atom_start],
+                hold_trailing_terminators=atom_start == len(text) and not final,
+            )
+            if pending:
+                return tuple(spans), pending
         if atom_start >= len(text):
             return tuple(spans), ""
 

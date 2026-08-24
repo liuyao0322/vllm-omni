@@ -352,9 +352,12 @@ prosodic or sentence meaning from the boundaries.
 For M1, `boundary_after` is exposed only after a confirmed strong terminator:
 `.`, `!`, `?`, `。`, `！`, `？`, `…`, or a newline. A terminator that might
 still belong to an unfinished decimal, address, abbreviation, or other
-recognized atom remains pending until following input disambiguates it. Commas
-and transport packet seams do not create boundaries. EOF always flushes the
-remaining non-whitespace source, even without a strong terminator;
+recognized atom remains pending until following input disambiguates it.
+Consecutive terminators such as `...` or `?!` form one boundary rather than
+punctuation-only requests. A terminator run at the current transport frontier
+remains pending until a following non-terminator or EOF confirms the whole run.
+Commas and transport packet seams do not create boundaries. EOF always flushes
+the remaining non-whitespace source, even without a strong terminator;
 whitespace-only segments are not synthesized.
 
 M1 commitment mode has these availability constraints:
@@ -386,9 +389,13 @@ The implementation bounds all request-local accumulation:
   `input.text` messages; and
 - at most eight ready segments may wait in the synthesis queue.
 
-When the segment queue is full, reading/commitment waits for capacity. The
-server does not drop, reorder, merge, or force-release text to relieve
-backpressure. Exceeding a text limit fails the current utterance.
+When the segment queue is full, an independent segment producer waits for
+capacity while the WebSocket receive loop remains able to process control
+frames such as `session.close`. Segments already accepted from `input.text`
+are staged in source order, with their total memory bounded by the 128 KiB
+utterance limit. The server does not drop, reorder, merge, or force-release
+text to relieve backpressure. Exceeding a text limit fails the current
+utterance.
 
 If synthesis of a segment fails, the server reports `error`, marks that
 segment's `audio.done` with `error=true`, prevents later queued segments from
