@@ -218,6 +218,39 @@ class TestStreamingSpeechWebSocket:
             " What?!",
         ]
 
+    def test_commitment_newline_is_not_consumed_as_unit_whitespace(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(mocker=mocker, commitment_supported=True)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "language": "English",
+                        "text_input_mode": "commitment",
+                    }
+                )
+                ws.send_json({"type": "input.text", "text": "There are 3\nMore things. "})
+                ws.send_json({"type": "input.done"})
+
+                for expected_text in ("There are 3\n", "More things."):
+                    start = ws.receive_json()
+                    assert start["type"] == "audio.start"
+                    assert start["sentence_text"] == expected_text
+                    ws.receive_bytes()
+                    assert ws.receive_json()["type"] == "audio.done"
+
+                assert ws.receive_json() == {
+                    "type": "session.done",
+                    "utterance_index": 0,
+                    "total_sentences": 2,
+                }
+
+        assert [call.args[0].input for call in speech_service._generate_audio_bytes.await_args_list] == [
+            "There are 3\n",
+            "More things.",
+        ]
+
     @pytest.mark.asyncio
     async def test_commitment_queue_backpressures_segment_producer(self, mocker: MockerFixture):
         handler = OmniStreamingSpeechHandler(speech_service=mocker.MagicMock())

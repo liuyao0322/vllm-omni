@@ -349,6 +349,11 @@ def _scan_special(text: str, start: int, *, final: bool) -> _ScanResult:
             break
         if ch.isspace() and seen_digit:
             unit_start, following = _next_nonspace(text, index)
+            if "\n" in text[index:unit_start]:
+                # Newline is a documented strong boundary, never spacing
+                # inside a numeric-unit atom. Leave it to the natural scanner
+                # even when the next line begins with a valid unit prefix.
+                break
             if not following:
                 if final:
                     break

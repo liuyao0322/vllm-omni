@@ -229,6 +229,27 @@ def test_unit_prefix_backtracks_to_natural_text_after_a_mismatch() -> None:
     assert trace.committed_text == "战成2/2平局。"
 
 
+@pytest.mark.parametrize("line_break", ("\n", "\r\n", " \n ", "\t\n\t"))
+def test_numeric_unit_lookahead_stops_at_newline_for_every_packetization(line_break: str) -> None:
+    text = f"There are 3{line_break}More things."
+    boundary = text.index("\n") + 1
+    baseline = _trace((text,), finish=True)
+
+    assert ("special", "3") in baseline.atoms
+    assert all("\n" not in atom_text for _, atom_text in baseline.atoms)
+    assert baseline.strong_boundaries == (boundary, len(text))
+    assert _segments(baseline, text) == (text[:boundary], text[boundary:])
+    for packets in _packetizations(text):
+        assert _trace(packets, finish=True) == baseline
+
+
+def test_numeric_unit_lookahead_still_accepts_non_newline_whitespace() -> None:
+    trace = _trace(("Weight is 25", "\t kg, recorded."), finish=True)
+
+    assert ("special", "25\t kg") in trace.atoms
+    assert trace.strong_boundaries == (len("Weight is 25\t kg, recorded."),)
+
+
 def test_only_confirmed_strong_sentence_ends_set_boundary_metadata() -> None:
     policy = StreamingTextCommitmentPolicy()
     update = policy.feed("值12.5，继续。下一句!")
