@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from typing import Any
 
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.request import resolve_video_num_frames
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -65,12 +66,18 @@ class SanaVideoPipelineUtils(BasePipelineUtils):
         # Diffusers SANA-Video calls the shared request's `num_frames`
         # parameter `frames`.
         if (
-            sampling.num_frames is not None
-            and accepted_call_kwargs is not None
+            accepted_call_kwargs is not None
             and "frames" in accepted_call_kwargs
             and "num_frames" not in accepted_call_kwargs
         ):
-            call_kwargs["frames"] = sampling.num_frames
+            configured_default = call_kwargs.get("frames", 81)
+            if configured_default is None:
+                configured_default = 81
+            call_kwargs["frames"] = resolve_video_num_frames(
+                sampling.num_frames,
+                default_num_frames=configured_default,
+                is_dummy_run=req.is_dummy_run(),
+            )
 
         # SANA's startup dummy dimensions can map to a resolution bucket that
         # conflicts with the upstream pipeline's divisibility validation.

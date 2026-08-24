@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2025 SANA-Video Authors and The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -42,6 +45,7 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
+from vllm_omni.diffusion.request import resolve_video_num_frames
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from .pipeline_output import SanaVideoPipelineOutput
@@ -742,7 +746,11 @@ class SanaVideoPipeline(
         default_height, default_width = get_sana_video_default_resolution(self.transformer.config.sample_size)
         height = sampling.height or default_height
         width = sampling.width or default_width
-        num_frames = sampling.num_frames or 81
+        num_frames = resolve_video_num_frames(
+            sampling.num_frames,
+            default_num_frames=81,
+            is_dummy_run=req.is_dummy_run(),
+        )
         num_steps = sampling.num_inference_steps if sampling.num_inference_steps is not None else 50
         guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 6.0
         generator = sampling.generator

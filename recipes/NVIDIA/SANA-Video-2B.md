@@ -170,7 +170,7 @@ For 480p, expect `width=832` and `height=480`.
 The automated serving matrix covers both checkpoint variants:
 
 | Backend | 480p T2V | 720p T2V | 480p I2V | 720p I2V |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | Native vLLM-Omni | Validated | Validated | Validated | Validated |
 | Diffusers adapter | Validated | Validated | Validated | Validated |
 
@@ -180,10 +180,6 @@ validated compatibility/reference backend.
 
 #### Notes
 
-- Memory usage: the native 720p, 81-frame, 50-step request took 33.56 seconds
-  and reserved 23.58 GiB peak GPU memory. The corresponding
-  Diffusers-adapter I2V request took about 36.5 seconds and peaked at 25.6
-  GiB. A native 480p, 9-frame, one-step smoke run reserved 21.13 GiB.
 - Key flags: select I2V explicitly with `--model-class-name
   SanaImageToVideoPipeline`; SANA checkpoint `model_index.json` files declare
   the T2V class. Pass `motion_score` through `--extra-body`. The supplied
@@ -198,9 +194,52 @@ validated compatibility/reference backend.
   The denoising loop intentionally retains the checkpoint-compatible
   Diffusers `DPMSolverMultistepScheduler`.
 - Known limitations:
-  - Sequence/tensor/CFG parallelism, Cache-DiT, TeaCache, and step execution
+    - Sequence/tensor/CFG parallelism, Cache-DiT, TeaCache, and step execution
     are not validated for the native pipeline.
-  - The Diffusers backend is a compatibility path and does not provide native
+    - The Diffusers backend is a compatibility path and does not provide native
     vLLM-Omni parallelism or continuous batching.
-  - Native describes pipeline and Transformer ownership, not a zero-Diffusers
+    - Native describes pipeline and Transformer ownership, not a zero-Diffusers
     dependency guarantee.
+
+### 1x NVIDIA L20X
+
+#### Environment
+
+- Driver: 570.133.20
+- PyTorch: 2.13.0+cu130
+- Diffusers: 0.38.0
+- vLLM: 0.27.0
+- Nsight Systems: 2026.1
+- vLLM-Omni commit: `54fcc6d`
+
+#### Same-workload T2V comparison
+
+Both backends used
+`Efficient-Large-Model/SANA-Video_2B_480p_diffusers`, the same T2V prompt
+and seeds, 832×480 output, 81 frames, and four inference steps. One warmup
+request was excluded, followed by three measured requests.
+
+| Metric | Native vLLM-Omni | Diffusers adapter | Native delta |
+| --- | ---: | ---: | ---: |
+| E2E latency | 7.1600 ± 0.0043 s | 6.9761 ± 0.0517 s | +2.636% |
+| Throughput | 0.1397 req/s | 0.1433 req/s | -2.568% |
+| Peak reserved VRAM | 23,936 MiB | 19,060 MiB | +25.582% |
+| Initialization | 11.669 s | 20.236 s | -42.336% |
+
+The peak-memory result is not a Transformer-only comparison. For the 480p
+checkpoint, the native pipeline deliberately loads and decodes with the Wan
+VAE in FP32. This matches the upstream SANA-Video reference and the recorded
+accuracy-golden setup for this integration. The adapter launch uses
+`--dtype bfloat16` as the Diffusers pipeline-wide dtype, so its Wan VAE also
+runs in BF16.
+
+Peak VRAM is the CUDA allocator's maximum reserved memory over the complete
+request. It includes VAE decode activations and allocator-reserved blocks, not
+only live Transformer tensors. The different VAE precision policies are a
+material code-level difference and a likely contributor to the higher native
+high-water mark; the available full-request measurements do not isolate how
+much of the delta they account for. The 25.582% result should therefore not be
+interpreted as an isolated native Transformer memory regression. Exact
+attribution requires both paths to use the same VAE dtype. Changing the native
+480p VAE to BF16 would instead change the recorded golden/reference setup and
+requires a new accuracy study.

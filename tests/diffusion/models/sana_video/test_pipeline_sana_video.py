@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -75,7 +75,7 @@ def test_component_discovery_declarations():
 def test_sana_video_loads_concrete_gemma_tokenizer(monkeypatch):
     from vllm_omni.diffusion.models.sana_video import pipeline_sana_video
 
-    captured = {}
+    captured: dict[str, object] = {}
     expected = object()
 
     def fake_from_pretrained_with_prefetch(loader, model, **kwargs):
@@ -237,35 +237,151 @@ def test_sana_video_i2v_forward_maps_image_request(requested_output_type, expect
 
     def fake_generate_i2v(**kwargs):
         calls.append(kwargs)
-        return torch.zeros(1, 3, 9, 192, 320)
+        return torch.zeros(kwargs["num_videos_per_prompt"], 3, 9, 192, 320)
 
     pipeline._generate_i2v = fake_generate_i2v
     image = Image.new("RGB", (320, 192))
+    custom_timesteps = torch.tensor([900, 100])
     req = _make_request_batch(
         {"prompt": "a robot walks", "negative_prompt": "blurry", "multi_modal_data": {"image": image}},
         height=192,
         width=320,
         num_frames=9,
         num_inference_steps=2,
+        timesteps=custom_timesteps,
         guidance_scale=4.5,
+        num_outputs_per_prompt=2,
+        eta=0.25,
         seed=42,
         output_type=requested_output_type,
-        extra_args={"motion_score": 30, "use_resolution_binning": False},
+        extra_args={"clean_caption": True, "motion_score": 30, "use_resolution_binning": False},
     )
 
     output = pipeline.forward(req)
 
-    assert output.output.shape == (1, 3, 9, 192, 320)
+    assert output.output.shape == (2, 3, 9, 192, 320)
     assert calls[0]["image"] is image
     assert calls[0]["prompt"] == "a robot walks motion score: 30."
     assert calls[0]["negative_prompt"] == "blurry"
     assert calls[0]["frames"] == 9
+    assert calls[0]["timesteps"] is custom_timesteps
+    assert calls[0]["sigmas"] is None
+    assert calls[0]["num_videos_per_prompt"] == 2
+    assert calls[0]["eta"] == 0.25
+    assert calls[0]["clean_caption"] is True
     assert calls[0]["generator"].initial_seed() == 42
     assert calls[0]["output_type"] == expected_internal_output_type
 
 
-def test_sana_video_i2v_latent_output_skips_vae_decode(monkeypatch):
-    from vllm_omni.diffusion.models.sana_video import SanaImageToVideoPipeline, pipeline_sana_video_i2v
+def test_sana_video_i2v_forward_maps_custom_sigmas():
+    from vllm_omni.diffusion.models.sana_video import SanaImageToVideoPipeline
+
+    pipeline = object.__new__(SanaImageToVideoPipeline)
+    pipeline.device = torch.device("cpu")
+    pipeline.transformer = SimpleNamespace(config=SimpleNamespace(sample_size=30))
+    calls = []
+
+    def fake_generate_i2v(**kwargs):
+        calls.append(kwargs)
+        return torch.zeros(1, 3, 9, 192, 320)
+
+    pipeline._generate_i2v = fake_generate_i2v
+    sigmas = [1.0, 0.5]
+    output = pipeline.forward(
+        _make_request_batch(
+            {
+                "prompt": "a robot walks",
+                "multi_modal_data": {"image": Image.new("RGB", (320, 192))},
+            },
+            height=192,
+            width=320,
+            num_frames=9,
+            sigmas=sigmas,
+            generator_device="cpu",
+            extra_args={"use_resolution_binning": False},
+        )
+    )
+
+    assert output.output.shape == (1, 3, 9, 192, 320)
+    assert calls[0]["timesteps"] is None
+    assert calls[0]["sigmas"] is sigmas
+
+
+def test_sana_video_i2v_omitted_num_frames_uses_model_default():
+    from vllm_omni.diffusion.models.sana_video import SanaImageToVideoPipeline
+
+    pipeline = object.__new__(SanaImageToVideoPipeline)
+    pipeline.device = torch.device("cpu")
+    pipeline.transformer = SimpleNamespace(config=SimpleNamespace(sample_size=30))
+    calls = []
+
+    def fake_generate_i2v(**kwargs):
+        calls.append(kwargs)
+        return torch.zeros(1, 3, 81, 2, 2)
+
+    pipeline._generate_i2v = fake_generate_i2v
+    req = _make_request_batch(
+        {
+            "prompt": "a robot walks",
+            "multi_modal_data": {"image": Image.new("RGB", (320, 192))},
+        },
+        height=192,
+        width=320,
+        num_inference_steps=1,
+        generator_device="cpu",
+        extra_args={"use_resolution_binning": False},
+    )
+
+    assert req.sampling_params.num_frames == 1
+    output = pipeline.forward(req)
+
+    assert output.output.shape == (1, 3, 81, 2, 2)
+    assert calls[0]["frames"] == 81
+
+
+def test_sana_video_i2v_clean_caption_request_is_explicitly_rejected():
+    from vllm_omni.diffusion.models.sana_video import SanaImageToVideoPipeline
+
+    pipeline = object.__new__(SanaImageToVideoPipeline)
+    pipeline.device = torch.device("cpu")
+    pipeline.transformer = SimpleNamespace(config=SimpleNamespace(sample_size=30))
+    pipeline.text_encoder = SimpleNamespace(dtype=torch.float32)
+    pipeline.tokenizer = None
+    pipeline.check_inputs = lambda **_kwargs: None
+
+    req = _make_request_batch(
+        {
+            "prompt": "a robot walks",
+            "multi_modal_data": {"image": Image.new("RGB", (320, 192))},
+        },
+        height=192,
+        width=320,
+        num_frames=9,
+        generator_device="cpu",
+        extra_args={"clean_caption": True, "use_resolution_binning": False},
+    )
+
+    with pytest.raises(ValueError, match="does not support `clean_caption=True`"):
+        pipeline.forward(req)
+
+
+@pytest.mark.parametrize(
+    ("custom_timesteps", "custom_sigmas"),
+    [
+        (torch.tensor([4.0, 2.0]), None),
+        (None, [1.0, 0.5]),
+    ],
+)
+def test_sana_video_i2v_consumes_batch_schedule_and_step_kwargs(custom_timesteps, custom_sigmas):
+    from vllm_omni.diffusion.models.sana_video import SanaImageToVideoPipeline
+
+    calls = SimpleNamespace(
+        encode_prompt=[],
+        prepare_latents=[],
+        set_timesteps=[],
+        step=[],
+        transformer=[],
+    )
 
     class StubTransformer:
         dtype = torch.float32
@@ -276,14 +392,58 @@ def test_sana_video_i2v_latent_output_skips_vae_decode(monkeypatch):
             patch_size=(1, 1, 1),
         )
 
-        def __call__(self, hidden_states, **_kwargs):
+        def __call__(
+            self,
+            hidden_states,
+            *,
+            encoder_hidden_states,
+            encoder_attention_mask,
+            timestep,
+            return_dict,
+        ):
+            calls.transformer.append(
+                (
+                    hidden_states.shape,
+                    encoder_hidden_states.shape,
+                    encoder_attention_mask.shape,
+                    timestep.shape,
+                    return_dict,
+                )
+            )
             return (torch.zeros_like(hidden_states),)
 
     class StubScheduler:
         order = 1
 
-        def step(self, _noise_pred, _timestep, current_latents, return_dict=False):
-            assert return_dict is False
+        def set_timesteps(
+            self,
+            num_inference_steps=None,
+            *,
+            device=None,
+            timesteps=None,
+            sigmas=None,
+        ):
+            calls.set_timesteps.append(
+                {
+                    "num_inference_steps": num_inference_steps,
+                    "timesteps": timesteps,
+                    "sigmas": sigmas,
+                }
+            )
+            schedule_length = len(timesteps if timesteps is not None else sigmas)
+            self.timesteps = torch.arange(schedule_length, 0, -1, dtype=torch.float32, device=device)
+
+        def step(
+            self,
+            _noise_pred,
+            _timestep,
+            current_latents,
+            *,
+            eta,
+            generator,
+            return_dict,
+        ):
+            calls.step.append({"eta": eta, "generator": generator, "return_dict": return_dict})
             return (current_latents + 1,)
 
     class VaeMustNotBeUsed:
@@ -303,21 +463,27 @@ def test_sana_video_i2v_latent_output_skips_vae_decode(monkeypatch):
     pipeline.video_processor = SimpleNamespace(
         preprocess=lambda _image, height, width: torch.zeros(1, 3, height, width),
     )
-    pipeline.encode_prompt = lambda *_args, **_kwargs: (
-        torch.zeros(1, 1, 1),
-        torch.ones(1, 1, dtype=torch.bool),
-        torch.zeros(1, 1, 1),
-        torch.ones(1, 1, dtype=torch.bool),
-    )
     pipeline.progress_bar = lambda **_kwargs: nullcontext(SimpleNamespace(update=lambda: None))
 
-    initial_latents = torch.zeros(1, 4, 2, 2, 2)
-    pipeline._prepare_i2v_latents = lambda *_args, **_kwargs: initial_latents
-    monkeypatch.setattr(
-        pipeline_sana_video_i2v,
-        "retrieve_timesteps",
-        lambda *_args, **_kwargs: (torch.tensor([1.0]), 1),
-    )
+    def capture_encode_prompt(*_args, **kwargs):
+        calls.encode_prompt.append(kwargs)
+        batch_size = kwargs["num_videos_per_prompt"]
+        return (
+            torch.zeros(batch_size, 1, 1),
+            torch.ones(batch_size, 1, dtype=torch.bool),
+            torch.zeros(batch_size, 1, 1),
+            torch.ones(batch_size, 1, dtype=torch.bool),
+        )
+
+    pipeline.encode_prompt = capture_encode_prompt
+    initial_latents = torch.zeros(2, 4, 2, 2, 2)
+
+    def capture_prepare_latents(*_args, **kwargs):
+        calls.prepare_latents.append(kwargs)
+        return initial_latents
+
+    pipeline._prepare_i2v_latents = capture_prepare_latents
+    generator = torch.Generator(device="cpu").manual_seed(42)
 
     output = pipeline._generate_i2v(
         image=Image.new("RGB", (2, 2)),
@@ -326,17 +492,42 @@ def test_sana_video_i2v_latent_output_skips_vae_decode(monkeypatch):
         height=2,
         width=2,
         frames=2,
-        num_inference_steps=1,
-        guidance_scale=1.0,
-        generator=None,
+        num_inference_steps=50,
+        timesteps=custom_timesteps,
+        sigmas=custom_sigmas,
+        guidance_scale=4.5,
+        num_videos_per_prompt=2,
+        eta=0.25,
+        generator=generator,
         latents=None,
+        clean_caption=True,
         use_resolution_binning=False,
         max_sequence_length=1,
         output_type="latent",
     )
 
+    assert calls.encode_prompt[0]["num_videos_per_prompt"] == 2
+    assert calls.encode_prompt[0]["clean_caption"] is True
+    assert calls.prepare_latents[0]["batch_size"] == 2
+    assert len(calls.set_timesteps) == 1
+    assert calls.set_timesteps[0]["num_inference_steps"] is None
+    assert calls.set_timesteps[0]["timesteps"] is custom_timesteps
+    assert calls.set_timesteps[0]["sigmas"] is custom_sigmas
+    assert len(calls.step) == 2
+    assert all(call == {"eta": 0.25, "generator": generator, "return_dict": False} for call in calls.step)
+    assert all(
+        call
+        == (
+            torch.Size([4, 4, 2, 2, 2]),
+            torch.Size([4, 1, 1]),
+            torch.Size([4, 1]),
+            torch.Size([4, 1, 2, 2, 2]),
+            False,
+        )
+        for call in calls.transformer
+    )
     expected = initial_latents.clone()
-    expected[:, :, 1:] += 1
+    expected[:, :, 1:] += 2
     torch.testing.assert_close(output, expected)
 
 
@@ -400,7 +591,7 @@ def test_sana_video_t2v_complex_instruction_has_no_mutable_default():
     assert isinstance(SANA_VIDEO_COMPLEX_HUMAN_INSTRUCTION, tuple)
 
 
-def test_diffusers_adapter_maps_num_frames_to_frames():
+def test_diffusers_adapter_t2v_omitted_num_frames_uses_sana_default():
     from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
     from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import SanaVideoPipelineUtils
 
@@ -409,21 +600,21 @@ def test_diffusers_adapter_maps_num_frames_to_frames():
     adapter._pipeline_utils = SanaVideoPipelineUtils()
     adapter.od_config = SimpleNamespace(diffusers_call_kwargs={}, output_type=None)
 
-    kwargs = adapter._build_call_kwargs(
-        _make_request_batch(
-            {"prompt": "a robot walks", "negative_prompt": "blurry"},
-            num_frames=81,
-            seed=42,
-            generator_device="cpu",
-        )
+    req = _make_request_batch(
+        {"prompt": "a robot walks", "negative_prompt": "blurry"},
+        seed=42,
+        generator_device="cpu",
     )
+    assert req.sampling_params.num_frames == 1
+
+    kwargs = adapter._build_call_kwargs(req)
 
     assert kwargs["frames"] == 81
     assert "num_frames" not in kwargs
     assert kwargs["generator"].initial_seed() == 42
 
 
-def test_diffusers_adapter_maps_i2v_image_when_pipeline_accepts_it():
+def test_diffusers_adapter_i2v_omitted_num_frames_uses_sana_default():
     from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
     from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import SanaVideoPipelineUtils
 
@@ -433,20 +624,48 @@ def test_diffusers_adapter_maps_i2v_image_when_pipeline_accepts_it():
     adapter.od_config = SimpleNamespace(diffusers_call_kwargs={}, output_type=None)
     image = Image.new("RGB", (320, 192))
 
-    kwargs = adapter._build_call_kwargs(
-        _make_request_batch(
-            {"prompt": "a robot walks", "negative_prompt": "blurry", "multi_modal_data": {"image": image}},
-            num_frames=9,
-            seed=42,
-            generator_device="cpu",
-        )
+    req = _make_request_batch(
+        {"prompt": "a robot walks", "negative_prompt": "blurry", "multi_modal_data": {"image": image}},
+        seed=42,
+        generator_device="cpu",
     )
+    assert req.sampling_params.num_frames == 1
+
+    kwargs = adapter._build_call_kwargs(req)
 
     assert kwargs["image"] is image
     assert kwargs["prompt"] == "a robot walks"
     assert kwargs["negative_prompt"] == "blurry"
-    assert kwargs["frames"] == 9
+    assert kwargs["frames"] == 81
     assert kwargs["generator"].initial_seed() == 42
+
+
+@pytest.mark.parametrize(
+    ("sampling_overrides", "expected_frames"),
+    [
+        ({}, 49),
+        ({"num_frames": 9}, 9),
+    ],
+)
+def test_diffusers_adapter_sana_resolves_frame_precedence(sampling_overrides, expected_frames):
+    from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
+    from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import SanaVideoPipelineUtils
+
+    adapter = object.__new__(DiffusersAdapterPipeline)
+    adapter._accept_call_kwargs = {"prompt", "frames", "generator"}
+    adapter._pipeline_utils = SanaVideoPipelineUtils()
+    adapter.od_config = SimpleNamespace(diffusers_call_kwargs={"frames": 49}, output_type=None)
+
+    kwargs = adapter._build_call_kwargs(
+        _make_request_batch(
+            "a robot walks",
+            seed=42,
+            generator_device="cpu",
+            **sampling_overrides,
+        )
+    )
+
+    assert kwargs["frames"] == expected_frames
 
 
 @pytest.mark.parametrize("pipeline_class_name", ["SanaVideoPipeline", "SanaImageToVideoPipeline"])
@@ -567,7 +786,7 @@ def test_diffusers_adapter_disables_resolution_binning_for_warmup():
     from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import SanaVideoPipelineUtils
 
     adapter = object.__new__(DiffusersAdapterPipeline)
-    adapter._accept_call_kwargs = {"prompt", "use_resolution_binning", "generator"}
+    adapter._accept_call_kwargs = {"prompt", "frames", "use_resolution_binning", "generator"}
     adapter._pipeline_utils = SanaVideoPipelineUtils()
     adapter.od_config = SimpleNamespace(diffusers_call_kwargs={}, output_type=None)
 
@@ -580,6 +799,7 @@ def test_diffusers_adapter_disables_resolution_binning_for_warmup():
     )
 
     assert kwargs["use_resolution_binning"] is False
+    assert kwargs["frames"] == 1
 
 
 def test_pipeline_is_torch_module_and_supports_eval():
@@ -657,6 +877,62 @@ def test_forward_maps_omni_request_to_sana_generation_args(requested_output_type
     assert calls[0]["use_resolution_binning"] is False
     assert calls[0]["generator"].initial_seed() == 42
     assert calls[0]["output_type"] == expected_internal_output_type
+
+
+def test_sana_video_t2v_omitted_num_frames_uses_model_default():
+    from vllm_omni.diffusion.models.sana_video import SanaVideoPipeline
+
+    pipeline = object.__new__(SanaVideoPipeline)
+    pipeline.transformer = SimpleNamespace(config=SimpleNamespace(sample_size=30))
+    calls = []
+
+    def fake_generate(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(frames=torch.zeros(1, 3, 81, 2, 2))
+
+    pipeline._generate = fake_generate
+    req = _make_request_batch(
+        "a robot walks",
+        height=192,
+        width=320,
+        num_inference_steps=1,
+        generator_device="cpu",
+    )
+
+    assert req.sampling_params.num_frames == 1
+    output = pipeline.forward(req)
+
+    assert output.output.shape == (1, 3, 81, 2, 2)
+    assert calls[0]["frames"] == 81
+
+
+def test_sana_video_t2v_dummy_run_keeps_single_frame():
+    from vllm_omni.diffusion.models.sana_video import SanaVideoPipeline
+
+    pipeline = object.__new__(SanaVideoPipeline)
+    pipeline.transformer = SimpleNamespace(config=SimpleNamespace(sample_size=30))
+    calls = []
+
+    def fake_generate(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(frames=torch.zeros(1, 3, 1, 192, 320))
+
+    pipeline._generate = fake_generate
+
+    output = pipeline.forward(
+        _make_request_batch(
+            "dummy run",
+            request_id=DUMMY_DIFFUSION_REQUEST_ID,
+            height=192,
+            width=320,
+            num_frames=1,
+            num_inference_steps=1,
+            generator_device="cpu",
+        )
+    )
+
+    assert output.output.shape == (1, 3, 1, 192, 320)
+    assert calls[0]["frames"] == 1
 
 
 @pytest.mark.parametrize(

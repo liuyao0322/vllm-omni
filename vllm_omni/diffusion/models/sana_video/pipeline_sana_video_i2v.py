@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from vllm_omni.diffusion.models.sana_video.pipeline_sana_video import (
     resolve_sana_video_sample_size,
     retrieve_timesteps,
 )
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.request import OmniDiffusionRequest, resolve_video_num_frames
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniTextPrompt
 
@@ -187,7 +187,11 @@ class SanaImageToVideoPipeline(SanaVideoPipeline, SupportImageInput):
         default_height, default_width = get_sana_video_default_resolution(self.transformer.config.sample_size)
         height = sampling.height or default_height
         width = sampling.width or default_width
-        frames = sampling.num_frames or 81
+        frames = resolve_video_num_frames(
+            sampling.num_frames,
+            default_num_frames=81,
+            is_dummy_run=req.is_dummy_run(),
+        )
         num_steps = sampling.num_inference_steps if sampling.num_inference_steps is not None else 50
         guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 6.0
         generator = sampling.generator
@@ -207,9 +211,14 @@ class SanaImageToVideoPipeline(SanaVideoPipeline, SupportImageInput):
             width=width,
             frames=frames,
             num_inference_steps=num_steps,
+            timesteps=sampling.timesteps,
+            sigmas=sampling.sigmas,
             guidance_scale=guidance_scale,
+            num_videos_per_prompt=sampling.num_outputs_per_prompt or 1,
+            eta=sampling.eta,
             generator=generator,
             latents=sampling.latents,
+            clean_caption=bool(extra_args.get("clean_caption", False)),
             use_resolution_binning=bool(extra_args.get("use_resolution_binning", True)),
             max_sequence_length=sampling.max_sequence_length or 300,
             output_type="latent" if sampling.output_type == "latent" else "raw",
@@ -232,6 +241,11 @@ class SanaImageToVideoPipeline(SanaVideoPipeline, SupportImageInput):
         latents: torch.Tensor | None,
         use_resolution_binning: bool,
         max_sequence_length: int,
+        timesteps: list[int] | torch.Tensor | None = None,
+        sigmas: list[float] | None = None,
+        num_videos_per_prompt: int = 1,
+        eta: float = 0.0,
+        clean_caption: bool = False,
         output_type: str = "raw",
         complex_human_instruction: list[str] = SANA_VIDEO_I2V_COMPLEX_HUMAN_INSTRUCTION,
     ) -> torch.Tensor:
@@ -262,8 +276,9 @@ class SanaImageToVideoPipeline(SanaVideoPipeline, SupportImageInput):
             prompt,
             self.do_classifier_free_guidance,
             negative_prompt=negative_prompt,
+            num_videos_per_prompt=num_videos_per_prompt,
             device=self.device,
-            clean_caption=False,
+            clean_caption=clean_caption,
             max_sequence_length=max_sequence_length,
             complex_human_instruction=complex_human_instruction,
         )
@@ -275,6 +290,8 @@ class SanaImageToVideoPipeline(SanaVideoPipeline, SupportImageInput):
             self.scheduler,
             num_inference_steps=num_inference_steps,
             device=self.device,
+            timesteps=timesteps,
+            sigmas=sigmas,
         )
         image_tensor = self.video_processor.preprocess(image, height=height, width=width).to(
             self.device,
@@ -283,7 +300,7 @@ class SanaImageToVideoPipeline(SanaVideoPipeline, SupportImageInput):
         latent_channels = self.transformer.config.in_channels
         latents = self._prepare_i2v_latents(
             image_tensor,
-            batch_size=1,
+            batch_size=num_videos_per_prompt,
             num_channels_latents=latent_channels,
             height=height,
             width=width,
@@ -295,7 +312,7 @@ class SanaImageToVideoPipeline(SanaVideoPipeline, SupportImageInput):
 
         patch_t, patch_h, patch_w = self.transformer.config.patch_size
         conditioning_mask = latents.new_zeros(
-            1,
+            num_videos_per_prompt,
             1,
             latents.shape[2] // patch_t,
             latents.shape[3] // patch_h,
@@ -306,6 +323,7 @@ class SanaImageToVideoPipeline(SanaVideoPipeline, SupportImageInput):
             conditioning_mask = torch.cat([conditioning_mask, conditioning_mask])
 
         self._num_timesteps = len(timesteps)
+        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
         transformer_dtype = self.transformer.dtype
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for index, timestep_value in enumerate(timesteps):
@@ -328,6 +346,7 @@ class SanaImageToVideoPipeline(SanaVideoPipeline, SupportImageInput):
                     noise_pred[:, :, 1:],
                     timestep_value,
                     latents[:, :, 1:],
+                    **extra_step_kwargs,
                     return_dict=False,
                 )[0]
                 latents = torch.cat([latents[:, :, :1], denoised], dim=2)
