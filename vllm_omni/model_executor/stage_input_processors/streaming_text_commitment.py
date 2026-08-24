@@ -238,9 +238,10 @@ def _is_special_start_at(text: str, index: int) -> bool:
         return True
     if ch not in _LEADING_DECIMAL_POINTS:
         return False
-    if ch in _STRONG_SENTENCE_END and index > 0 and text[index - 1] in _STRONG_SENTENCE_END:
-        # In ``Wait...5``, the last point belongs to the maximal terminator
-        # run; it must not be reclassified as the start of ``.5``.
+    if ch == "." and index > 0 and text[index - 1] == ".":
+        # In ``Wait...5``, the last point belongs to the repeated-dot run; it
+        # must not be reclassified as the start of ``.5``. Other sentence
+        # boundaries, such as a newline or ``。``, can precede a new decimal.
         return False
     following = text[index + 1] if index + 1 < len(text) else ""
     return _is_digit(following)

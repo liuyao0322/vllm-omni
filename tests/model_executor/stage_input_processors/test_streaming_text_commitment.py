@@ -275,6 +275,20 @@ def test_leading_decimal_is_one_special_atom_for_every_packetization(decimal: st
         assert _trace(packets, finish=True) == baseline
 
 
+@pytest.mark.parametrize("terminator", ("!", "?", "。", "！", "？", "…", "\n", "\r\n"))
+def test_leading_decimal_after_non_dot_terminator_is_atomic_for_every_packetization(terminator: str) -> None:
+    prefix = f"Value:{terminator}"
+    decimal = ".5 seconds."
+    text = prefix + decimal
+    baseline = _trace((text,), finish=True)
+
+    assert ("special", ".5 seconds") in baseline.atoms
+    assert baseline.strong_boundaries == (len(prefix), len(text))
+    assert _segments(baseline, text) == (prefix, decimal)
+    for packets in _packetizations(text):
+        assert _trace(packets, finish=True) == baseline
+
+
 def test_decimal_point_at_packet_frontier_stays_pending() -> None:
     policy = StreamingTextCommitmentPolicy()
 

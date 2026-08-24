@@ -196,10 +196,10 @@ class TestStreamingSpeechWebSocket:
                         "text_input_mode": "commitment",
                     }
                 )
-                ws.send_json({"type": "input.text", "text": ".5 seconds. Wait... What?! "})
+                ws.send_json({"type": "input.text", "text": "Value:\n.5 seconds. Wait... What?! "})
                 ws.send_json({"type": "input.done"})
 
-                for expected_text in (".5 seconds.", " Wait...", " What?!"):
+                for expected_text in ("Value:\n", ".5 seconds.", " Wait...", " What?!"):
                     start = ws.receive_json()
                     assert start["type"] == "audio.start"
                     assert start["sentence_text"] == expected_text
@@ -209,10 +209,11 @@ class TestStreamingSpeechWebSocket:
                 assert ws.receive_json() == {
                     "type": "session.done",
                     "utterance_index": 0,
-                    "total_sentences": 3,
+                    "total_sentences": 4,
                 }
 
         assert [call.args[0].input for call in speech_service._generate_audio_bytes.await_args_list] == [
+            "Value:\n",
             ".5 seconds.",
             " Wait...",
             " What?!",
