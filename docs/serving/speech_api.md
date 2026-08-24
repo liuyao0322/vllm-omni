@@ -418,8 +418,10 @@ upstream LLM) pays the WebSocket handshake once instead of once per utterance.
   those compatibility fields count the ordered independent segments within
   the same utterance.
 - End the connection with `session.close`, or by closing the socket. An idle
-  connection is still closed after the server's idle timeout, which now also
-  applies to the gap between utterances.
+  connection is still closed after the server's idle timeout, including gaps
+  between utterances and unresolved-input periods with no committed work.
+  Queued or in-flight commitment synthesis is server generation time, not
+  client idle time; a fresh idle window starts when that work settles.
 
 ### Session Config Parameters
 

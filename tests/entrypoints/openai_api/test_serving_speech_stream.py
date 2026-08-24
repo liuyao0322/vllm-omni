@@ -3,6 +3,7 @@
 
 import asyncio
 import base64
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -201,6 +202,97 @@ class TestStreamingSpeechWebSocket:
         assert state.queue.get_nowait() == "first"
         await asyncio.wait_for(enqueue, timeout=1)
         assert state.queue.get_nowait() == "second!"
+
+    @pytest.mark.asyncio
+    async def test_receive_keeps_pending_frame_when_committed_work_settles(self, mocker: MockerFixture):
+        handler = OmniStreamingSpeechHandler(speech_service=mocker.MagicMock())
+        state = streaming_speech_module._CommitmentUtterance(
+            index=0,
+            config=streaming_speech_module.StreamingSpeechSessionConfig(),
+        )
+        state.queue.put_nowait("work")
+
+        worker_stop = asyncio.Event()
+        state.worker = asyncio.create_task(worker_stop.wait())
+        receive_started = asyncio.Event()
+        frame_ready = asyncio.Event()
+
+        class ProbeWebSocket:
+            receive_calls = 0
+
+            async def receive_text(self):
+                self.receive_calls += 1
+                receive_started.set()
+                await frame_ready.wait()
+                return '{"type":"input.text","text":"next"}'
+
+        websocket = ProbeWebSocket()
+        receive = asyncio.create_task(
+            handler._receive_text(
+                websocket,  # type: ignore[arg-type]
+                timeout=1,
+                commitment=state,
+            )
+        )
+        try:
+            await asyncio.wait_for(receive_started.wait(), timeout=1)
+            assert state.queue.get_nowait() == "work"
+            state.queue.task_done()
+            await state.queue.join()
+            await asyncio.sleep(0)
+            frame_ready.set()
+
+            assert await asyncio.wait_for(receive, timeout=1) == (
+                '{"type":"input.text","text":"next"}',
+                False,
+            )
+            assert websocket.receive_calls == 1
+        finally:
+            worker_stop.set()
+            await state.worker
+
+    @pytest.mark.asyncio
+    async def test_receive_preserves_next_frame_after_eof_worker_finishes(self, mocker: MockerFixture):
+        handler = OmniStreamingSpeechHandler(speech_service=mocker.MagicMock())
+        state = streaming_speech_module._CommitmentUtterance(
+            index=0,
+            config=streaming_speech_module.StreamingSpeechSessionConfig(),
+            eof=True,
+        )
+
+        worker_stop = asyncio.Event()
+        state.worker = asyncio.create_task(worker_stop.wait())
+        receive_started = asyncio.Event()
+        frame_ready = asyncio.Event()
+
+        class ProbeWebSocket:
+            receive_calls = 0
+
+            async def receive_text(self):
+                self.receive_calls += 1
+                receive_started.set()
+                await frame_ready.wait()
+                return '{"type":"input.text","text":"next utterance"}'
+
+        websocket = ProbeWebSocket()
+        receive = asyncio.create_task(
+            handler._receive_text(
+                websocket,  # type: ignore[arg-type]
+                timeout=1,
+                commitment=state,
+            )
+        )
+        await asyncio.wait_for(receive_started.wait(), timeout=1)
+        worker_stop.set()
+        await state.worker
+        await asyncio.sleep(0)
+        frame_ready.set()
+
+        assert await asyncio.wait_for(receive, timeout=1) == (
+            '{"type":"input.text","text":"next utterance"}',
+            True,
+        )
+        assert websocket.receive_calls == 1
 
     @pytest.mark.asyncio
     async def test_websocket_writes_are_serialized(self):
@@ -574,6 +666,98 @@ class TestStreamingSpeechWebSocket:
                     "type": "error",
                     "message": "Idle timeout: no message received",
                 }
+
+    def test_commitment_active_generation_pauses_idle_timeout(self, mocker: MockerFixture):
+        generation_started = threading.Event()
+        release_generation = threading.Event()
+
+        async def blocked_audio(*_args, **_kwargs):
+            generation_started.set()
+            await asyncio.to_thread(release_generation.wait)
+            return b"RIFF", "audio/wav"
+
+        app, speech_service = _build_test_app(
+            idle_timeout=0.02,
+            commitment_supported=True,
+            mocker=mocker,
+        )
+        speech_service._generate_audio_bytes.side_effect = blocked_audio
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "language": "English",
+                        "text_input_mode": "commitment",
+                    }
+                )
+                ws.send_json({"type": "input.text", "text": "Hello!"})
+
+                assert ws.receive_json() == {
+                    "type": "audio.start",
+                    "utterance_index": 0,
+                    "sentence_index": 0,
+                    "sentence_text": "Hello!",
+                    "format": "wav",
+                }
+                assert generation_started.wait(timeout=1)
+
+                try:
+                    # Hold generation across ten idle-timeout windows. Active
+                    # model work is not client idleness and must not be
+                    # cancelled or aborted.
+                    assert not release_generation.wait(timeout=0.2)
+                    speech_service.engine_client.abort.assert_not_awaited()
+                finally:
+                    # Also release the worker when an assertion fails so the
+                    # TestClient server thread cannot be left behind.
+                    release_generation.set()
+
+                assert ws.receive_bytes() == b"RIFF"
+                assert ws.receive_json() == {
+                    "type": "audio.done",
+                    "utterance_index": 0,
+                    "sentence_index": 0,
+                    "total_bytes": 4,
+                    "error": False,
+                }
+
+                # No EOF was sent. Once generation finishes, the empty queue
+                # is genuinely idle and the receive timeout starts again.
+                assert ws.receive_json() == {
+                    "type": "error",
+                    "message": "Idle timeout: no message received",
+                }
+
+        speech_service.engine_client.abort.assert_not_awaited()
+
+    def test_commitment_unresolved_suffix_still_times_out(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(
+            idle_timeout=0.02,
+            commitment_supported=True,
+            mocker=mocker,
+        )
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "language": "English",
+                        "text_input_mode": "commitment",
+                    }
+                )
+                # With no committed boundary, the worker has no queued or
+                # active generation to exclude from the idle budget.
+                ws.send_json({"type": "input.text", "text": "unresolved"})
+                assert ws.receive_json() == {
+                    "type": "error",
+                    "message": "Idle timeout: no message received",
+                }
+
+        speech_service._generate_audio_bytes.assert_not_awaited()
+        speech_service.engine_client.abort.assert_not_awaited()
 
     def test_streaming_multiple_binary_frames(self, mocker: MockerFixture):
         captured_requests = []

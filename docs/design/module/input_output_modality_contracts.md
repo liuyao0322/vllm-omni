@@ -160,6 +160,12 @@ denotes an explicit end-of-input boundary, not successful synthesis: it is
 emitted after EOF also for a failed utterance, but not after disconnect or
 `session.close` cancellation.
 
+The transport idle budget MUST NOT cancel queued or in-flight committed
+synthesis. Generation time pauses that budget, and a fresh idle window starts
+when all pre-EOF committed work settles. The idle budget still applies while
+only unresolved text remains, after `session.done`, and whenever no committed
+work is ready or in flight.
+
 The public WebSocket default remains whole-utterance `buffered` mode. M1
 `commitment` mode is limited to Qwen3-TTS with an explicitly configured
 `Chinese` or `English` language. Every ready segment is a new, independent

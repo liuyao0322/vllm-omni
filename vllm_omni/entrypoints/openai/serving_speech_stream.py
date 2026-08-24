@@ -190,11 +190,10 @@ class OmniStreamingSpeechHandler:
                     raw, worker_finished = await self._receive_text(
                         websocket,
                         timeout=self._config_timeout if config is None else self._idle_timeout,
-                        draining=commitment,
+                        commitment=commitment,
                     )
                     if worker_finished:
                         commitment = None
-                        continue
                 except asyncio.TimeoutError:
                     if config is None:
                         await self._send_error(websocket, "Timeout waiting for session.config")
@@ -332,31 +331,59 @@ class OmniStreamingSpeechHandler:
         websocket: WebSocket,
         *,
         timeout: float,
-        draining: _CommitmentUtterance | None,
+        commitment: _CommitmentUtterance | None,
     ) -> tuple[str, bool]:
-        """Receive input while noticing an EOF worker completing.
+        """Receive input while accounting for committed server work.
 
-        During commitment drain the client must still be able to close the
-        connection, and overlapping input must be rejected instead of being
-        silently reinterpreted as the next utterance. The drain time itself is
-        generation time, not client idle time; the idle clock restarts once the
-        worker emits ``session.done``.
+        Committed synthesis time is server work, not client idle time. Before
+        EOF, ``queue.join()`` covers every queued or in-flight segment. After
+        EOF, the worker itself is authoritative because it emits
+        ``session.done``. The same receive task survives both transitions so a
+        message arriving exactly as work settles cannot be lost.
         """
-        if draining is None or not draining.eof or draining.worker is None:
+        if commitment is None or commitment.worker is None:
             return await asyncio.wait_for(websocket.receive_text(), timeout=timeout), False
 
         receive_task = asyncio.create_task(websocket.receive_text())
-        done, _ = await asyncio.wait(
-            {receive_task, draining.worker},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if receive_task in done:
-            return receive_task.result(), False
+        join_task: asyncio.Task[None] | None = None
+        try:
+            if commitment.eof:
+                server_work: asyncio.Task[None] = commitment.worker
+            else:
+                join_task = asyncio.create_task(commitment.queue.join())
+                server_work = join_task
 
-        receive_task.cancel()
-        await asyncio.gather(receive_task, return_exceptions=True)
-        await draining.worker
-        return "", True
+            # Always notice an unexpectedly terminated worker as well as the
+            # normal EOF completion. Never cancel the worker from this helper.
+            done, _ = await asyncio.wait(
+                {receive_task, server_work, commitment.worker},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if receive_task in done:
+                worker_finished = commitment.worker.done()
+                if worker_finished:
+                    await commitment.worker
+                return receive_task.result(), worker_finished
+
+            if commitment.worker in done:
+                await commitment.worker
+                worker_finished = True
+            else:
+                await server_work
+                worker_finished = False
+
+            # Server work has settled. Start a fresh, full idle window while
+            # retaining the receive already in progress.
+            raw = await asyncio.wait_for(receive_task, timeout=timeout)
+            return raw, worker_finished
+        finally:
+            helper_tasks = [receive_task]
+            if join_task is not None:
+                helper_tasks.append(join_task)
+            for task in helper_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*helper_tasks, return_exceptions=True)
 
     def _start_commitment_utterance(
         self,
@@ -454,6 +481,10 @@ class OmniStreamingSpeechHandler:
                 state.queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
+            else:
+                # Every successful put contributes to queue.join(), including
+                # an EOF marker which may be discarded on a failure path.
+                state.queue.task_done()
 
     async def _commitment_worker(
         self,
@@ -464,41 +495,44 @@ class OmniStreamingSpeechHandler:
         try:
             while True:
                 item = await state.queue.get()
-                if item is _UTTERANCE_EOF:
-                    break
-                if state.failed:
-                    continue
-
-                sentence_text = str(item)
-                # Every count corresponds to an audio.start. Preconditions
-                # which reject before audio.start therefore do not increment.
-                precondition_error = self._generation_precondition_error(state.config)
-                if precondition_error is not None:
-                    await self._send_error(websocket, precondition_error)
-                    state.failed = True
-                    self._drop_queued_segments(state)
-                    if state.eof:
+                try:
+                    if item is _UTTERANCE_EOF:
                         break
-                    continue
+                    if state.failed:
+                        continue
 
-                state.started_sentences += 1
-                succeeded = await self._generate_and_send(
-                    websocket,
-                    state.config,
-                    sentence_text,
-                    utterance_index=state.index,
-                    sentence_index=sentence_index,
-                    active_request_ids=state.active_request_ids,
-                    aborted_request_ids=state.aborted_request_ids,
-                    suppress_done_on_cancel=True,
-                    cancellation_event=state.cancellation_event,
-                )
-                sentence_index += 1
-                if not succeeded:
-                    state.failed = True
-                    self._drop_queued_segments(state)
-                    if state.eof:
-                        break
+                    sentence_text = str(item)
+                    # Every count corresponds to an audio.start. Preconditions
+                    # which reject before audio.start therefore do not increment.
+                    precondition_error = self._generation_precondition_error(state.config)
+                    if precondition_error is not None:
+                        await self._send_error(websocket, precondition_error)
+                        state.failed = True
+                        self._drop_queued_segments(state)
+                        if state.eof:
+                            break
+                        continue
+
+                    state.started_sentences += 1
+                    succeeded = await self._generate_and_send(
+                        websocket,
+                        state.config,
+                        sentence_text,
+                        utterance_index=state.index,
+                        sentence_index=sentence_index,
+                        active_request_ids=state.active_request_ids,
+                        aborted_request_ids=state.aborted_request_ids,
+                        suppress_done_on_cancel=True,
+                        cancellation_event=state.cancellation_event,
+                    )
+                    sentence_index += 1
+                    if not succeeded:
+                        state.failed = True
+                        self._drop_queued_segments(state)
+                        if state.eof:
+                            break
+                finally:
+                    state.queue.task_done()
         finally:
             if state.eof and not state.cancellation_event.is_set():
                 try:
@@ -532,6 +566,9 @@ class OmniStreamingSpeechHandler:
             await self._abort_request_once(request_id, state.aborted_request_ids)
         if state.worker is not None:
             await asyncio.gather(state.worker, return_exceptions=True)
+        # The worker accounts for an item it already owns in its per-item
+        # finally block. Drain leftovers only after it has stopped consuming.
+        self._drop_queued_segments(state)
 
     async def _abort_request_once(self, request_id: str, aborted: set[str]) -> None:
         if request_id in aborted:
