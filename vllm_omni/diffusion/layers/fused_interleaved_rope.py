@@ -3,10 +3,7 @@
 
 """Paired interleaved RoPE with Diffusers-compatible arithmetic.
 
-The paired-kernel design is adapted from SGLang PR #35695.  SGLang preserves
-an FP64 RoPE-table contract, while vLLM-Omni follows Diffusers and casts the
-SANA-Video tables with the transformer.  This implementation therefore
-supports the BF16 production tables as well as the FP32 construction-time
+This implementation supports the BF16 production tables as well as the FP32 construction-time
 tables without changing either eager numerical contract.
 """
 
