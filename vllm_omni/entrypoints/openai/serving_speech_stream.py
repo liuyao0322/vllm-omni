@@ -295,7 +295,10 @@ class OmniStreamingSpeechHandler:
                     total_sentences = 0
                     if full_text:
                         # However long the buffered text is, the pipeline takes
-                        # it as one request, so every flush is sentence 0 of 1.
+                        # it as one request. Count it only when the generation
+                        # preconditions allow _generate_and_send to emit the
+                        # corresponding audio.start event.
+                        total_sentences = int(self._generation_precondition_error(config) is None)
                         await self._generate_and_send(
                             websocket,
                             config,
@@ -303,7 +306,6 @@ class OmniStreamingSpeechHandler:
                             utterance_index=utterance_index,
                             sentence_index=0,
                         )
-                        total_sentences = 1
 
                     await websocket.send_json(
                         {
@@ -834,7 +836,7 @@ class OmniStreamingSpeechHandler:
             active_request_ids.add(request_id)
         try:
             if config.stream_audio:
-                prepared_request_id, generator, _ = await self._speech_service._prepare_speech_generation(
+                prepared_request_id, generator, tts_params = await self._speech_service._prepare_speech_generation(
                     request,
                     request_id=request_id,
                 )
@@ -852,9 +854,16 @@ class OmniStreamingSpeechHandler:
                         utterance_index=utterance_index,
                         sentence_index=sentence_index,
                         language=config.language,
+                        tts_params=tts_params,
                     )
                 else:
-                    async with aclosing(self._speech_service._generate_pcm_chunks(generator, request_id)) as stream:
+                    async with aclosing(
+                        self._speech_service._generate_pcm_chunks(
+                            generator,
+                            request_id,
+                            tts_params=tts_params,
+                        )
+                    ) as stream:
                         async for chunk in stream:
                             total_bytes += len(chunk)
                             await websocket.send_bytes(chunk)
@@ -889,6 +898,7 @@ class OmniStreamingSpeechHandler:
                 await self._send_error(
                     websocket,
                     f"Generation failed for utterance {utterance_index}, sentence {sentence_index}: {e}",
+                    partial_audio=total_bytes > 0,
                 )
         finally:
             if request_id is not None and active_request_ids is not None:
@@ -919,6 +929,7 @@ class OmniStreamingSpeechHandler:
         utterance_index: int,
         sentence_index: int,
         language: str | None = None,
+        tts_params: dict | None = None,
     ) -> int:
         """Stream PCM as JSON ``audio.chunk`` frames, aligned per sentence.
 
@@ -965,6 +976,7 @@ class OmniStreamingSpeechHandler:
                 generator,
                 request_id,
                 include_sample_rate=True,
+                tts_params=tts_params,
                 collect=collect,
             )
         ) as stream:
@@ -990,14 +1002,15 @@ class OmniStreamingSpeechHandler:
         return total_bytes
 
     @staticmethod
-    async def _send_error(websocket: WebSocket, message: str) -> None:
+    async def _send_error(websocket: WebSocket, message: str, *, partial_audio: bool = False) -> None:
         """Send an error message to the client."""
         try:
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "message": message,
-                }
-            )
+            payload: dict[str, object] = {
+                "type": "error",
+                "message": message,
+            }
+            if partial_audio:
+                payload.update(partial_audio=True, action="discard")
+            await websocket.send_json(payload)
         except Exception:
             pass  # Connection may already be closed; safe to ignore

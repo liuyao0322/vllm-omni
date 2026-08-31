@@ -131,7 +131,7 @@ Content-Type: application/json
 
 | Parameter | Type | Default | Description |
 | ----------- | ------ | --------- | ------------- |
-| `ref_audio` | string | null | Reference audio (HTTP URL, base64 data URL, or `file://` URI with `--allowed-local-media-path`) |
+| `ref_audio` | string | null | Reference audio (HTTP URL, base64 data URL, or `file://` URI with `--allowed-local-media-path`). Local files fold `mtime_ns` and `size` into cache keys to automatically reload on-disk edits; HTTP URLs and base64 URIs remain cached by string locator. |
 | `ref_text` | string | null | Transcript of reference audio |
 | `x_vector_only_mode` | bool | null | Use speaker embedding only (no ICL) |
 
@@ -306,7 +306,7 @@ Client -> Server:
 | `{"type": "session.config", ...}` | Session configuration (first message; may be resent between utterances to change it) |
 | `{"type": "input.text", "text": "..."}` | Text chunk. It is accumulated in `buffered` mode or fed to the readiness policy in `commitment` mode. |
 | `{"type": "input.done"}` | End-of-input for the current utterance. It flushes buffered text or closes and flushes the commitment policy, waits for submitted work, and keeps the connection open. |
-| `{"type": "session.close"}` | Cancel the current utterance and close the connection. There is no separate `input.cancel` message. |
+| `{"type": "session.close"}` | Close the connection. In `commitment` mode it cancels active and queued synthesis. In `buffered` mode it discards text not yet submitted, but a close frame received after `input.done` cannot be handled until that request settles. There is no separate `input.cancel` message. |
 
 Server -> Client:
 
@@ -401,9 +401,9 @@ If synthesis of a segment fails, the server reports `error`, marks that
 segment's `audio.done` with `error=true`, prevents later queued segments from
 starting, and waits for `input.done`. EOF then emits `session.done` so the
 connection can return to idle. That event is only an utterance boundary; use
-`error` and `audio.done.error` to determine success. Client disconnect and
-`session.close` abort active generation, discard unsubmitted or queued work,
-and do not emit `session.done`.
+`error` and `audio.done.error` to determine success. In commitment mode, client
+disconnect and `session.close` abort active generation, discard unsubmitted or
+queued work, and do not emit `session.done`.
 
 ### Flushing vs. Closing
 
@@ -920,6 +920,51 @@ If you encounter OOM errors:
 ### Unsupported Speaker
 
 Use `/v1/audio/voices` to list available voices for the loaded model.
+
+## Orchestration Loop (experimental)
+
+Multi-stage omni deployments route stage outputs through a single orchestrator
+loop. By default that loop polls every stage replica on a 1 ms cadence. An
+opt-in event-driven mode replaces the poll with one reader task per live stage
+replica awaiting its client directly, and switches the serving-side
+final-output drain to a condition-variable wakeup at the same time.
+
+**Configuration (environment variables):**
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | `0` (off) | Switches the orchestration loop and the final-output drain from the legacy 1 ms poll to event-driven wakeups. Enabled by `1`, `true`, `yes`, or `on`, matched case-insensitively after surrounding whitespace is stripped; any other value leaves it off. |
+
+Set it on the process that runs the orchestrator (stage 0 of an omni
+deployment) before starting the server:
+
+```bash
+export VLLM_OMNI_EVENT_DRIVEN_ORCH=1
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --omni \
+    --port 8091
+```
+
+The server logs the selected loop mode and its reader/poller counts once at
+startup, so you can confirm which loop is live.
+
+Routing, output ordering, and terminal-state behavior are identical on both
+loops; only the poll cadence changes. Leaving the variable unset keeps the
+legacy poll loop, which is the supported default.
+
+**Known limitations:**
+
+- The measured serving A/B (idle CPU 2.43% to 0.07%; TTFP p99 -32% at
+  concurrency 8) predates the rebuild on the per-replica fault-isolation work
+  in [#4285](https://github.com/vllm-project/vllm-omni/pull/4285). That work
+  changed dead-replica handling and reader/poller lifecycle rather than the
+  steady-state output path, and the parity suite covers it, but the serving
+  A/B has not been re-run on the current head.
+- The diffusion-poller branch is covered by unit tests only. Deployments whose
+  stages all run as standard engine cores never exercise it, including GLM-TTS,
+  which deploys its DiT without `stage_type: diffusion`.
+- Concurrency 1 and 32 measured at parity with the legacy loop. At 32 the
+  latency is admission-bound, which this mode does not address.
 
 ## Development
 
