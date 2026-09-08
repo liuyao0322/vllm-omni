@@ -68,6 +68,25 @@ def test_regionally_compile_matches_wrapped_blocks_by_declared_container_attr(mo
     assert model.transformer_blocks[0].forward("ok") == "compiled:ok"
 
 
+def test_regionally_compile_can_disable_offload_container_matching(monkeypatch):
+    model = _ModelWithWrappedRepeatedBlocks()
+    model._regional_compile_blocks_attrs = []
+    model._repeated_blocks = ["Linear"]
+    model.region = nn.Linear(2, 2)
+    compile_calls = []
+
+    def _compile(fn, *args, **kwargs):
+        compile_calls.append(fn.__self__)
+        return fn
+
+    monkeypatch.setattr(compile_module.torch, "compile", _compile)
+
+    regionally_compile(model)
+
+    assert compile_calls == [model.region]
+    assert model._layerwise_offload_blocks_attrs == ["transformer_blocks"]
+
+
 def test_regionally_compile_merges_model_options_without_mutating_inputs(monkeypatch):
     model = _ModelWithRegionalCompileOptions()
     caller_options = {"epilogue_fusion": True}

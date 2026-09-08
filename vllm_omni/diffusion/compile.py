@@ -54,7 +54,11 @@ def regionally_compile(
         logger.warning("Regional compilation skipped because the model does not define `_repeated_blocks`.")
         return model
 
-    repeated_block_attrs = getattr(model, "_layerwise_offload_blocks_attrs", [])
+    # Models that compile inner regions can opt out of matching whole offload
+    # containers. Keep the offload-container fallback for existing models.
+    repeated_block_attrs = getattr(
+        model, "_regional_compile_blocks_attrs", getattr(model, "_layerwise_offload_blocks_attrs", [])
+    )
 
     # Some repeated regions require model-specific Inductor options to retain
     # their eager numerical contract. Keep those defaults next to the model
