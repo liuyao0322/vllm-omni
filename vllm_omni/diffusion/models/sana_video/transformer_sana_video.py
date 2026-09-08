@@ -36,12 +36,12 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as OmniAttention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
-from vllm_omni.diffusion.layers.residual_gate import residual_gate_add
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
     get_sp_group,
 )
+from vllm_omni.diffusion.layers.residual_gate import residual_gate_add
 
 
 def validate_sana_video_parallel_config(parallel_config) -> None:
