@@ -19,9 +19,10 @@ the checkpoint's layout is reinterpreted.
 Attention uses the project's diffusion attention layer when its selected
 backend supports the runtime dtype. This ``LLM_GENERATION`` stage does not set
 a diffusion backend and therefore gets the platform default. CUDA commonly
-resolves that default to FlashAttention, so the model routes its native
-float32 decode through SDPA while retaining FlashAttention for supported
-lower-precision inputs. An explicitly selected backend remains authoritative.
+resolves that default to FlashAttention, cuDNN, or FlashInfer, so the model
+routes its native float32 decode through SDPA while retaining the selected
+backend for supported lower-precision inputs. An explicitly selected backend
+remains authoritative.
 """
 
 from __future__ import annotations
@@ -75,13 +76,16 @@ _TRANSFORMER_IN_DIM = DIT_LATENT_CHANNELS * 2 + _CONDITION_DIM
 _SIGMA_FLOOR = 1e-6
 
 # These backends reject float32 Q/K/V. MiniMax Music 3 decodes in float32, so
-# an automatically selected Flash backend must not receive its attention
-# tensors. Explicit backend choices retain the shared layer's fail-fast
-# contract instead of being silently replaced here.
+# automatically selected incompatible backends must not receive its attention
+# tensors. This includes cuDNN and FlashInfer selected on Blackwell. Explicit
+# backend choices retain the shared layer's fail-fast contract instead of
+# being silently replaced here.
 _FLOAT32_UNSUPPORTED_BACKENDS = {
     "FLASH_ATTN",
     "FLASH_ATTN_HUB",
     "FLASH_ATTN_3_HUB",
+    "CUDNN_ATTN",
+    "FLASHINFER_ATTN",
 }
 
 

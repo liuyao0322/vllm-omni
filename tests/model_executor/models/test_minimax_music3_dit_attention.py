@@ -12,6 +12,14 @@ from vllm_omni.model_executor.models.minimax_music3 import dit
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+_FLOAT32_INCOMPATIBLE_BACKENDS = [
+    "FLASH_ATTN",
+    "FLASH_ATTN_HUB",
+    "FLASH_ATTN_3_HUB",
+    "CUDNN_ATTN",
+    "FLASHINFER_ATTN",
+]
+
 
 class _BackendType:
     def __init__(self, name: str) -> None:
@@ -42,9 +50,9 @@ def _attention(monkeypatch, *, backend_name: str, explicit: bool):
 
 @pytest.mark.parametrize(
     "backend_name",
-    ["FLASH_ATTN", "FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB"],
+    _FLOAT32_INCOMPATIBLE_BACKENDS,
 )
-def test_float32_uses_sdpa_for_automatic_flash_backend(monkeypatch, backend_name):
+def test_float32_uses_sdpa_for_automatic_incompatible_backend(monkeypatch, backend_name):
     attention, backend = _attention(monkeypatch, backend_name=backend_name, explicit=False)
     q = torch.randn(2, 5, 2, 4)
 
@@ -62,6 +70,7 @@ def test_float32_uses_sdpa_for_automatic_flash_backend(monkeypatch, backend_name
     assert attention.backend_name == f"TORCH_SDPA(float32)/{backend_name}(lower precision)"
 
 
+@pytest.mark.parametrize("backend_name", _FLOAT32_INCOMPATIBLE_BACKENDS)
 @pytest.mark.parametrize(
     ("dtype", "explicit"),
     [
@@ -70,8 +79,8 @@ def test_float32_uses_sdpa_for_automatic_flash_backend(monkeypatch, backend_name
         (torch.float32, True),
     ],
 )
-def test_lower_precision_or_explicit_flash_backend_remains_authoritative(monkeypatch, dtype, explicit):
-    attention, backend = _attention(monkeypatch, backend_name="FLASH_ATTN", explicit=explicit)
+def test_lower_precision_or_explicit_backend_remains_authoritative(monkeypatch, backend_name, dtype, explicit):
+    attention, backend = _attention(monkeypatch, backend_name=backend_name, explicit=explicit)
     q = torch.zeros(1, 3, 2, 4, dtype=dtype)
 
     actual = attention._attend(q, q, q)
@@ -98,7 +107,7 @@ def test_float32_uses_sdpa_when_native_attention_is_unavailable(monkeypatch):
     assert attention.backend_name == "TORCH_SDPA"
 
 
-def test_float32_keeps_non_flash_automatic_backend(monkeypatch):
+def test_float32_keeps_compatible_automatic_backend(monkeypatch):
     attention, backend = _attention(monkeypatch, backend_name="SDPA", explicit=False)
     q = torch.zeros(1, 3, 2, 4)
 
