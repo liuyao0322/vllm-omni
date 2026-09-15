@@ -425,42 +425,132 @@ def _append_natural_spans(
     return ""
 
 
-def _parse(text: str, *, final: bool) -> tuple[tuple[CommittedTextSpan, ...], str]:
-    spans: list[CommittedTextSpan] = []
-    cursor = 0
-    while cursor < len(text):
-        atom_start = cursor
-        while atom_start < len(text) and not (
-            _is_lexical_start(text[atom_start]) or _is_special_start_at(text, atom_start)
-        ):
-            atom_start += 1
-        if atom_start > cursor:
-            pending = _append_natural_spans(
-                spans,
-                text[cursor:atom_start],
-                hold_trailing_terminators=atom_start == len(text) and not final,
-            )
-            if pending:
-                return tuple(spans), pending
-        if atom_start >= len(text):
-            return tuple(spans), ""
+class _ScanState(str, Enum):
+    SCAN = "scan"
+    NATURAL = "natural"
+    LEXICAL = "lexical"
+    SPECIAL = "special"
+    READY = "ready"
+    HOLD = "hold"
+    DONE = "done"
 
-        kind: Literal["lexical", "special"]
-        if _is_lexical_start(text[atom_start]):
-            kind = "lexical"
-            result = _scan_lexical(text, atom_start, final=final)
-        else:
-            kind = "special"
-            result = _scan_special(text, atom_start, final=final)
 
-        if result.end == len(text) and not final and not result.stable_at_frontier:
-            return tuple(spans), text[atom_start:]
-        if result.end <= atom_start:
+class _ScanEvent(str, Enum):
+    NATURAL = "natural"
+    LEXICAL = "lexical"
+    SPECIAL = "special"
+    READY = "ready"
+    INCOMPLETE = "incomplete"
+    ADVANCE = "advance"
+    END = "end"
+
+
+# Control-plane transitions are independent of the recognizers below. Adding
+# a recognizer requires an explicit SCAN transition and a readiness decision;
+# recognizers never emit source or choose synthesis boundaries themselves.
+_SCAN_TRANSITIONS = {
+    (_ScanState.SCAN, _ScanEvent.NATURAL): _ScanState.NATURAL,
+    (_ScanState.SCAN, _ScanEvent.LEXICAL): _ScanState.LEXICAL,
+    (_ScanState.SCAN, _ScanEvent.SPECIAL): _ScanState.SPECIAL,
+    (_ScanState.SCAN, _ScanEvent.END): _ScanState.DONE,
+    (_ScanState.NATURAL, _ScanEvent.ADVANCE): _ScanState.SCAN,
+    (_ScanState.NATURAL, _ScanEvent.INCOMPLETE): _ScanState.HOLD,
+    (_ScanState.LEXICAL, _ScanEvent.READY): _ScanState.READY,
+    (_ScanState.LEXICAL, _ScanEvent.INCOMPLETE): _ScanState.HOLD,
+    (_ScanState.SPECIAL, _ScanEvent.READY): _ScanState.READY,
+    (_ScanState.SPECIAL, _ScanEvent.INCOMPLETE): _ScanState.HOLD,
+    (_ScanState.READY, _ScanEvent.ADVANCE): _ScanState.SCAN,
+}
+
+
+def _source_event(text: str, index: int) -> _ScanEvent:
+    """Ordered atom-start guards; a leading decimal takes special precedence."""
+    if index == len(text):
+        return _ScanEvent.END
+    if _is_lexical_start(text[index]):
+        return _ScanEvent.LEXICAL
+    if _is_special_start_at(text, index):
+        return _ScanEvent.SPECIAL
+    return _ScanEvent.NATURAL
+
+
+class _CommitmentScanner:
+    """Finite-state source scanner for one transactional feed.
+
+    SCAN classifies the next atom, a recognizer decides READY or HOLD, and
+    READY is the sole emission point for lexical/special spans. Natural runs
+    retain their separate maximal-terminator boundary rule. HOLD retains the
+    original suffix; the next feed replays it with new input. EOF makes an
+    otherwise incomplete atom READY. No normalization occurs in this machine.
+    """
+
+    def __init__(self, text: str, *, final: bool) -> None:
+        self.text = text
+        self.final = final
+        self.cursor = 0
+        self.state = _ScanState.SCAN
+        self.spans: list[CommittedTextSpan] = []
+        self.pending = ""
+        self.candidate: CommittedTextSpan | None = None
+        self.candidate_end = 0
+
+    def _classify(self) -> _ScanEvent:
+        return _source_event(self.text, self.cursor)
+
+    def _natural(self) -> _ScanEvent:
+        end = self.cursor + 1
+        while _source_event(self.text, end) is _ScanEvent.NATURAL:
+            end += 1
+        self.pending = _append_natural_spans(
+            self.spans,
+            self.text[self.cursor : end],
+            hold_trailing_terminators=end == len(self.text) and not self.final,
+        )
+        self.cursor = end
+        return _ScanEvent.INCOMPLETE if self.pending else _ScanEvent.ADVANCE
+
+    def _atom(self) -> _ScanEvent:
+        kinds: dict[_ScanState, SpanKind] = {
+            _ScanState.LEXICAL: "lexical",
+            _ScanState.SPECIAL: "special",
+        }
+        recognizer = {
+            _ScanState.LEXICAL: _scan_lexical,
+            _ScanState.SPECIAL: _scan_special,
+        }[self.state]
+        result = recognizer(self.text, self.cursor, final=self.final)
+        if result.end <= self.cursor:
             raise AssertionError("commitment scanner made no progress")
-        spans.append(CommittedTextSpan(text[atom_start : result.end], kind))
-        cursor = result.end
+        if result.end == len(self.text) and not self.final and not result.stable_at_frontier:
+            self.pending = self.text[self.cursor :]
+            return _ScanEvent.INCOMPLETE
+        self.candidate = CommittedTextSpan(self.text[self.cursor : result.end], kinds[self.state])
+        self.candidate_end = result.end
+        return _ScanEvent.READY
 
-    return tuple(spans), ""
+    def _emit(self) -> _ScanEvent:
+        assert self.candidate is not None
+        self.spans.append(self.candidate)
+        self.cursor = self.candidate_end
+        self.candidate = None
+        return _ScanEvent.ADVANCE
+
+    def run(self) -> tuple[tuple[CommittedTextSpan, ...], str]:
+        actions = {
+            _ScanState.SCAN: self._classify,
+            _ScanState.NATURAL: self._natural,
+            _ScanState.LEXICAL: self._atom,
+            _ScanState.SPECIAL: self._atom,
+            _ScanState.READY: self._emit,
+        }
+        while self.state not in {_ScanState.HOLD, _ScanState.DONE}:
+            event = actions[self.state]()
+            self.state = _SCAN_TRANSITIONS[self.state, event]
+        return tuple(self.spans), self.pending
+
+
+def _parse(text: str, *, final: bool) -> tuple[tuple[CommittedTextSpan, ...], str]:
+    return _CommitmentScanner(text, final=final).run()
 
 
 class StreamingTextCommitmentPolicy:

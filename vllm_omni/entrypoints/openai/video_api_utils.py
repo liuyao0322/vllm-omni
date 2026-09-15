@@ -1,7 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
-Shared helper utilities for OpenAI-compatible video generation API.
+Shared media utilities for OpenAI-compatible video APIs.
+
+PUT HERE:
+  - Shared media backends reused by generation and streaming serving:
+    decode/encode of image/video/audio references and frames, streaming
+    encoders, frame/audio coercion. No FastAPI Request / job-store orchestration.
+
+DO NOT PUT HERE:
+  - ``/v1/videos*`` multipart form parsing, upload limits, job runners,
+    cleanup, or response factories — those go in ``video.generation.helpers``.
+
+LONGEVITY:
+  - This root utils file is a **temporary shared home**.
+  - TODO(#5227, P1.3): tidy up / move into the video family (e.g.
+    ``video/generation/media.py``) in the P1.3 video modality PR; do not treat this
+    file as the long-term owner.
+  - ``video.generation.helpers`` is the longer home for ``/v1/videos*``
+    endpoint logic through P0.2/P0.3 until P1.3 further splits it.
+
+See ``openai/README.md`` and ``video/README.md`` (utils vs helpers, no overlap).
 """
 
 from __future__ import annotations
@@ -71,6 +90,21 @@ class VideoFrames(list[Image.Image]):
         self.source_path = source_path
 
 
+class _ImagePixelLimitError(InvalidInputReferenceError):
+    """An image exceeded a configured or decoder-enforced pixel limit."""
+
+
+def _validate_image_pixel_limit(image: Image.Image) -> None:
+    width, height = image.size
+    max_pixels = envs.VLLM_MAX_IMAGE_PIXELS
+    if max_pixels > 0 and width * height > max_pixels:
+        raise _ImagePixelLimitError(
+            f"Image dimensions {width}x{height} ({width * height} pixels) exceed "
+            f"the maximum of {max_pixels} pixels. Set "
+            f"VLLM_MAX_IMAGE_PIXELS to increase this limit."
+        )
+
+
 def positive_float(value: Any) -> float | None:
     if value is None:
         return None
@@ -87,7 +121,13 @@ def positive_float(value: Any) -> float | None:
 
 def _decode_image_bytes(image_bytes: bytes, *, source: str) -> Image.Image:
     try:
-        return Image.open(BytesIO(image_bytes)).convert("RGB")
+        with Image.open(BytesIO(image_bytes)) as image:
+            _validate_image_pixel_limit(image)
+            return image.convert("RGB")
+    except _ImagePixelLimitError:
+        raise
+    except Image.DecompressionBombError as exc:
+        raise _ImagePixelLimitError(f"Invalid {source}: image exceeds the decoder pixel limit.") from exc
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         raise InvalidInputReferenceError(f"Invalid {source}: provided content is not a valid image.") from exc
 
@@ -135,7 +175,9 @@ def _decode_video_bytes(
         frames_array, metadata = loader.load_bytes(
             video_bytes,
             num_frames=num_frames,
-            backend="pyav",
+            # vLLM 0.29 removed the "pyav" decoder backend; "opencv" is
+            # upstream's default and the remaining CPU-only option.
+            backend="opencv",
             keep=keep,
         )
     except Exception as exc:
@@ -158,6 +200,8 @@ def _decode_media_bytes(
 ) -> Image.Image | VideoFrames:
     try:
         return _decode_image_bytes(media_bytes, source=source)
+    except _ImagePixelLimitError:
+        raise
     except InvalidInputReferenceError:
         try:
             return _decode_video_bytes(
@@ -396,7 +440,7 @@ def _normalize_video_tensor(video_tensor: torch.Tensor) -> np.ndarray:
         # Cast to float32 first: bf16 (e.g. SANA-WM's refiner output) has no
         # numpy dtype, so ``.numpy()`` below raises on it.
         video_tensor = video_tensor.float().clamp(-1, 1) * 0.5 + 0.5
-    else:
+    elif video_tensor.dtype != torch.uint8:
         video_tensor = video_tensor.to(torch.float32) / 255.0
     video_array = video_tensor.numpy()
     return _normalize_single_video_array(video_array)
@@ -419,7 +463,7 @@ def _normalize_single_video_array(video_array: np.ndarray) -> np.ndarray:
     if np.issubdtype(video_array.dtype, np.floating):
         if video_array.size and (video_array.min() < 0.0 or video_array.max() > 1.0):
             video_array = np.clip(video_array, -1.0, 1.0) * 0.5 + 0.5
-    elif np.issubdtype(video_array.dtype, np.integer):
+    elif video_array.dtype != np.uint8 and np.issubdtype(video_array.dtype, np.integer):
         video_array = video_array.astype(np.float32) / 255.0
     return video_array
 
@@ -435,7 +479,7 @@ def _normalize_video_array(video_array: np.ndarray) -> list[np.ndarray] | np.nda
 
 
 def _normalize_frames(frames: list[Any]) -> list[np.ndarray]:
-    """Normalize a list of frames into numpy arrays with values in [0,1]."""
+    """Normalize a list of frames into numpy arrays, uint8 ones unchanged."""
     normalized: list[np.ndarray] = []
     for frame in frames:
         if isinstance(frame, torch.Tensor):
@@ -453,7 +497,7 @@ def _normalize_frames(frames: list[Any]) -> list[np.ndarray]:
         if np.issubdtype(frame_array.dtype, np.floating):
             if frame_array.size and (frame_array.min() < 0.0 or frame_array.max() > 1.0):
                 frame_array = np.clip(frame_array, -1.0, 1.0) * 0.5 + 0.5
-        elif np.issubdtype(frame_array.dtype, np.integer):
+        elif frame_array.dtype != np.uint8 and np.issubdtype(frame_array.dtype, np.integer):
             frame_array = frame_array.astype(np.float32) / 255.0
 
         normalized.append(frame_array)
@@ -461,7 +505,14 @@ def _normalize_frames(frames: list[Any]) -> list[np.ndarray]:
 
 
 def _coerce_video_to_frames(video: Any) -> list[np.ndarray]:
-    """Convert a video payload into a list of normalized float32 frames."""
+    """Convert a video payload into a list of normalized frames.
+
+    Frames are float32 in [0, 1], except uint8 ones, which pass through: the
+    muxer's own dtype is uint8, so normalising here would only pay for a
+    full-size conversion each way. The direct planar path additionally needs
+    contiguous channel planes and falls back for interleaved RGB whatever the
+    dtype; the standard muxer takes the uint8 frames as they are.
+    """
     if isinstance(video, torch.Tensor):
         video_array = _normalize_video_tensor(video)
         return list(video_array)
@@ -779,7 +830,7 @@ def _encode_video_bytes_legacy(
 
 def _encode_video_bytes(
     video: Any,
-    fps: int,
+    fps: int | float,
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
@@ -901,7 +952,7 @@ def create_streaming_video_encoder(
 
 def encode_video_base64(
     video: Any,
-    fps: int,
+    fps: int | float,
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,

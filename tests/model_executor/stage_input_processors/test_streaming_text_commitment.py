@@ -210,6 +210,24 @@ def test_dotted_abbreviation_keeps_its_terminal_dot_without_a_sentence_boundary(
     assert _trace(packets, finish=True) == _trace((full_text,), finish=True)
 
 
+def test_mixed_atoms_and_boundaries_survive_all_two_packet_splits() -> None:
+    text = "金额25摄氏度。API costs $.5 kg!\nNext e.g. 中文?! "
+    expected = _trace((text,), finish=True)
+    assert expected.committed_text == text
+    assert expected.atoms == (
+        ("special", "25摄氏度"),
+        ("lexical", "API"),
+        ("lexical", "costs"),
+        ("special", "$.5 kg"),
+        ("lexical", "Next"),
+        ("lexical", "e.g."),
+    )
+    assert len(expected.strong_boundaries) == 3
+    for seam in range(len(text) + 1):
+        assert _trace((text[:seam], text[seam:]), finish=True) == expected
+    assert _trace(tuple(text), finish=True) == expected
+
+
 def test_raw_span_kinds_do_not_send_ordinary_words_to_special_normalization() -> None:
     trace = _trace(("The API costs 25元。",), finish=True)
 

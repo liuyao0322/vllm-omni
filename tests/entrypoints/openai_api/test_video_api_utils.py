@@ -23,9 +23,9 @@ from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _png_bytes() -> bytes:
+def _png_bytes(size: tuple[int, int] = (2, 1)) -> bytes:
     buffer = BytesIO()
-    Image.new("RGB", (2, 1), color=(12, 34, 56)).save(buffer, format="PNG")
+    Image.new("RGB", size, color=(12, 34, 56)).save(buffer, format="PNG")
     return buffer.getvalue()
 
 
@@ -120,6 +120,52 @@ async def test_decode_image_url_keeps_data_urls_local(monkeypatch):
 
     assert image.size == (2, 1)
     assert image.mode == "RGB"
+
+
+def test_decode_image_bytes_rejects_image_over_pixel_limit_before_conversion(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 100)
+
+    def _unexpected_convert(*args, **kwargs):
+        pytest.fail("over-limit images must be rejected before conversion")
+
+    monkeypatch.setattr(Image.Image, "convert", _unexpected_convert)
+
+    with pytest.raises(
+        InvalidInputReferenceError,
+        match=r"Image dimensions 20x20 \(400 pixels\) exceed the maximum of 100 pixels",
+    ):
+        video_api_utils._decode_image_bytes(_png_bytes((20, 20)), source="image reference")
+
+
+def test_decode_image_bytes_maps_pillow_pixel_limit_error(monkeypatch):
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 100)
+
+    with pytest.raises(InvalidInputReferenceError, match="decoder pixel limit") as exc_info:
+        video_api_utils._decode_image_bytes(_png_bytes((20, 20)), source="image reference")
+
+    assert isinstance(exc_info.value.__cause__, Image.DecompressionBombError)
+
+
+@pytest.mark.parametrize("max_pixels", [0, 400])
+def test_decode_image_bytes_allows_disabled_or_inclusive_pixel_limit(monkeypatch, max_pixels):
+    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", max_pixels)
+
+    image = video_api_utils._decode_image_bytes(_png_bytes((20, 20)), source="image reference")
+
+    assert image.size == (20, 20)
+    assert image.mode == "RGB"
+
+
+@pytest.mark.asyncio
+async def test_decode_input_reference_preserves_image_pixel_limit_error(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 100)
+
+    with pytest.raises(InvalidInputReferenceError, match="VLLM_MAX_IMAGE_PIXELS"):
+        await video_api_utils.decode_input_reference(
+            image_reference=None,
+            video_reference=None,
+            input_reference_bytes=_png_bytes((20, 20)),
+        )
 
 
 def _install_fake_video_mux(monkeypatch, mux_calls):
@@ -520,6 +566,32 @@ def test_interleaved_video_uses_legacy_fallback_automatically(monkeypatch):
     assert len(coerce_calls) == 1
 
 
+def test_uint8_frames_reach_the_muxer_without_a_float_round_trip():
+    """uint8 is the muxer's own dtype, so normalisation must leave it alone.
+
+    MiniMax-H3 quantises on the accelerator to keep the response small across
+    its two process hops. Re-normalising to float here would undo that at the
+    last step and cost a full-size conversion in each direction.
+    """
+    video = np.arange(2 * 4 * 5 * 3, dtype=np.uint8).reshape(2, 4, 5, 3)
+
+    frames, frame_shape, common_dtype = video_api_utils._prepare_video_frames(video)
+
+    assert common_dtype == np.dtype(np.uint8)
+    assert frame_shape == (4, 5, 3)
+    np.testing.assert_array_equal(np.stack(frames), video)
+
+
+def test_non_uint8_integer_frames_are_still_normalised():
+    """Only uint8 is the muxer's dtype; other integer payloads still scale."""
+    video = np.full((2, 4, 5, 3), 255, dtype=np.int32)
+
+    frames, _, common_dtype = video_api_utils._prepare_video_frames(video)
+
+    assert np.issubdtype(common_dtype, np.floating)
+    np.testing.assert_allclose(frames[0], 1.0)
+
+
 @pytest.mark.parametrize(
     "video",
     [
@@ -552,9 +624,10 @@ def test_prepared_automatic_fallback_preserves_legacy_quantization(monkeypatch, 
     monkeypatch.setattr(media_utils, "mux_video_audio_bytes", fake_compat_mux)
 
     prepared_frames, frame_shape, _ = video_api_utils._prepare_video_frames(video)
-    reference = np.rint(np.clip(np.stack([frame[..., :3] for frame in prepared_frames]), 0.0, 1.0) * 255.0).astype(
-        np.uint8
-    )
+    stacked = np.stack([frame[..., :3] for frame in prepared_frames])
+    # uint8 frames are the muxer's own dtype and reach it unchanged; everything
+    # else is still quantised out of the normalised [0, 1] range.
+    reference = stacked if stacked.dtype == np.uint8 else np.rint(np.clip(stacked, 0.0, 1.0) * 255.0).astype(np.uint8)
 
     assert video_api_utils._encode_video_bytes(video, fps=12) == b"legacy-video"
     assert len(mux_inputs) == 1

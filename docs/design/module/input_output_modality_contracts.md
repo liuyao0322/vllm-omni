@@ -144,6 +144,40 @@ continuity mechanism. Expanding its languages or pattern tables requires a new
 or explicitly versioned policy contract rather than silently changing the
 meaning of `zh_en_special_v1`.
 
+#### Scanner states and recognition rules
+
+The scanner has an explicit transition table, `_SCAN_TRANSITIONS`. Each feed
+starts in `SCAN` on the previous pending suffix plus the new packet. This
+replay is transactional: a failed scan publishes no new spans. Recognizers
+return an end offset and readiness; they do not normalize or submit text.
+
+| State | Event / condition | Next state and action |
+| --- | --- | --- |
+| SCAN | Natural character | NATURAL: scan up to the next atom start |
+| SCAN | ASCII/full-width letter | LEXICAL: recognize a word or dotted atom |
+| SCAN | Digit, leading symbol, or leading decimal | SPECIAL: recognize numeric/symbol/unit text |
+| SCAN | No remaining source | DONE |
+| NATURAL | Confirmed source | SCAN: emit natural spans and maximal terminator boundaries |
+| NATURAL | Trailing terminator run or ambiguous decimal point | HOLD: retain that suffix |
+| LEXICAL / SPECIAL | Atom ends before the frontier, or explicit EOF | READY |
+| LEXICAL / SPECIAL | Atom can continue beyond the packet frontier | HOLD: retain the entire raw atom |
+| READY | Emit candidate once | SCAN: advance to the candidate end |
+
+The finite `zh_en_special_v1` recognizer rules are:
+
+| Class | Continuations recognized | Release / hold rule |
+| --- | --- | --- |
+| Lexical | Alphanumerics, superscripts, internal `.@'_+-`, dotted abbreviations such as `e.g.` | Hold a trailing word or ambiguous connector; a dotted abbreviation's last dot belongs to the atom |
+| Numeric / symbol | Digits, ASCII letters, operators, currency and percentage symbols, keycaps | Hold the complete expression at a packet frontier; VS16 may precede a keycap in another packet |
+| Decimal / separator | `.`, `．`, comma and colon followed by alphanumerics | Hold ambiguous trailing punctuation; a leading decimal remains atomic, except inside an ASCII repeated-dot run |
+| Unit | Explicit `_CJK_UNITS` and `_ASCII_UNITS` token tables, case-insensitive longest-complete matching | Hold a unit prefix at the frontier; backtrack to the last complete match on mismatch |
+| Unit spacing | Spaces or tabs between numeric source and a unit | Hold unresolved lookahead; never cross a newline, including CRLF |
+| Natural boundary | `. ! ? 。 ！ ？ …` and newline | Coalesce adjacent terminators; hold the frontier run until more input or EOF |
+
+The recognizers remain finite rule-based scanners. A future WFST recognizer
+can provide atom-end/readiness decisions at the same boundary, but this FSM
+does not claim weighted normalization or a general TN grammar.
+
 ### IO-INV-103: Streaming TTS input completion flushes pending text
 
 **Rule:** End-of-input MUST explicitly close the commitment policy and release
@@ -176,6 +210,28 @@ The public WebSocket default remains whole-utterance `buffered` mode. M1
 `Chinese` or `English` language. Every ready segment is a new, independent
 one-shot TTS request; model, scheduler, connector, Talker, and Code2Wav state is
 not inherited across segment boundaries.
+
+Adapters declare `TextCommitmentCapabilities`: profile, languages, independent
+segment behavior, context preservation, audio streaming, word timestamps, and
+failed-segment retries. The M1 handler validates the declared contract and
+rejects unsupported combinations. In particular, a stateful adapter cannot be
+silently run through the independent-request path. Word timestamps also require
+the deployment's forced aligner. `split_granularity` must be `none` when using
+commitment; the separate linguistic splitter remains available in buffered mode.
+
+Independent requests repeat prefill and incur per-segment scheduling and cleanup
+costs. They can introduce audible prosody discontinuities; M1 does not promise
+long-form acoustic continuity. Use the default buffered mode without splitting
+when one-request synthesis is preferable. Smaller commitment segments trade
+earlier audio for those costs, and this PR makes no throughput improvement claim.
+
+Future cross-segment inheritance requires a logical stream identity distinct
+from engine request IDs, a monotonic segment sequence shared across stages,
+health validation before accepting inherited state, and terminal/error cleanup
+for the whole stream. Talker history is a separate model-specific contract.
+Those prerequisites must be implemented and measured before an adapter can
+advertise preserved cross-segment context; adding a stream ID alone would not
+provide acoustic continuity.
 
 The following are outside M1: M2 rho/CAPS or capacity-driven hard cuts,
 resumable scheduler requests or dummy end-of-input tokens, connector protocol
