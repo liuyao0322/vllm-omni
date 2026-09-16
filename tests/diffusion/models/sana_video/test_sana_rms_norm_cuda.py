@@ -159,6 +159,53 @@ def test_launch_failure_disables_signature_and_returns_eager(monkeypatch: pytest
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
+@pytest.mark.parametrize("verified", [False, True])
+def test_oom_preserves_signature_and_allows_retry(verified: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    hidden_states = torch.randn((1, 1024, 2240), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(2240, device="cuda", dtype=torch.bfloat16)
+    expected = _reference(hidden_states, weight, 1e-5)
+    signature = sana_rms._signature(hidden_states)
+    if verified:
+        with torch.no_grad():
+            sana_rms.exact_sana_rms_norm(hidden_states, weight, 1e-5)
+        assert signature in sana_rms._VERIFIED_SIGNATURES
+
+    launch = sana_rms._launch_exact_sana_rms_norm
+    oom = torch.OutOfMemoryError("synthetic temporary memory pressure")
+    calls = 0
+
+    def fail_once(*args) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise oom
+        return launch(*args)
+
+    monkeypatch.setattr(sana_rms, "_launch_exact_sana_rms_norm", fail_once)
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            sana_rms,
+            "_eager_sana_rms_norm",
+            lambda *_args: pytest.fail("OOM must propagate without an eager fallback"),
+        )
+        with torch.no_grad(), pytest.raises(torch.OutOfMemoryError) as exc_info:
+            sana_rms.exact_sana_rms_norm(hidden_states, weight, 1e-5)
+
+    assert exc_info.value is oom
+    assert (signature in sana_rms._VERIFIED_SIGNATURES) is verified
+    assert signature not in sana_rms._DISABLED_SIGNATURES
+
+    with torch.no_grad():
+        result = sana_rms.exact_sana_rms_norm(hidden_states, weight, 1e-5)
+
+    assert calls == 2
+    assert _raw_equal(result, expected)
+    assert signature in sana_rms._VERIFIED_SIGNATURES
+    assert signature not in sana_rms._DISABLED_SIGNATURES
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 def test_verified_signature_skips_reference_and_runs_during_capture(monkeypatch: pytest.MonkeyPatch) -> None:
     hidden_states = torch.randn((1, 1024, 2240), device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(2240, device="cuda", dtype=torch.bfloat16)

@@ -15,9 +15,10 @@ only fuses the two bandwidth-heavy pointwise regions around them:
 * normalization, the explicit BF16 rounding point, and weight multiplication.
 
 The first eligible input signature is compared bit-for-bit with the eager
-expression.  A mismatch or launch failure permanently disables that
+expression.  A mismatch or non-OOM launch failure permanently disables that
 signature, while unsupported platforms, layouts, dtypes, small tensors,
 autograd, and compiled regions keep the original PyTorch expression.
+Out-of-memory errors propagate without changing the signature state.
 """
 
 from __future__ import annotations
@@ -258,6 +259,9 @@ def exact_sana_rms_norm(
 
     try:
         output = torch.ops.vllm_omni.exact_sana_rms_norm(hidden_states, weight, eps)
+    except torch.OutOfMemoryError:
+        # Temporary memory pressure does not invalidate this kernel signature.
+        raise
     except Exception as error:
         _DISABLED_SIGNATURES.add(signature)
         logger.warning_once(
