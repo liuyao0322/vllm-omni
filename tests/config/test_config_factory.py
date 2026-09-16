@@ -197,6 +197,25 @@ class TestStageConfig:
         omega_config = config.to_omegaconf()
         assert omega_config.engine_args.max_num_seqs == 32
 
+    def test_to_omegaconf_dict_override_deep_merges_yaml_dict(self):
+        """A partial dict CLI override (e.g. --no-guardrails riding on
+        model_config) must layer onto the YAML dict, not clobber siblings."""
+        config = StageConfig(
+            stage_id=0,
+            model_stage="diffusion",
+            stage_type=StageType.DIFFUSION,
+            yaml_engine_args={
+                "model_config": {
+                    "guardrails": True,
+                    "policy_server_config": {"action_space": "joint_position"},
+                }
+            },
+            runtime_overrides={"model_config": {"guardrails": False}},
+        )
+        omega_config = config.to_omegaconf()
+        assert omega_config.engine_args.model_config.guardrails is False
+        assert omega_config.engine_args.model_config.policy_server_config.action_space == "joint_position"
+
     def test_to_omegaconf_diffusion_parallel_overrides_replace_nested_values(self):
         config = StageConfig(
             stage_id=1,
@@ -623,6 +642,58 @@ class TestPipelineDiscovery:
         assert p.hf_architectures == ("SomeCollidingArch",)
 
 
+class TestCosmos3PolicyPipeline:
+    """Cosmos3 policy serving resolves via deploy yaml selection (π0 precedent)."""
+
+    def test_registered_without_capturing_base_cosmos3_checkpoints(self):
+        assert "cosmos3_policy" in OMNI_PIPELINES
+        # T2I/video Cosmos3 checkpoints report model_type=cosmos3_omni and the
+        # same model_index.json _class_name as policy checkpoints; they must
+        # keep resolving through the single-stage diffusion fallback, so the
+        # policy pipeline must not be reachable by auto-detection.
+        assert "cosmos3_omni" not in OMNI_PIPELINES
+        pipeline = OMNI_PIPELINES["cosmos3_policy"]
+        assert pipeline.hf_architectures == ()
+        assert pipeline.diffusers_class_name is None
+
+    def test_droid_deploy_yaml_carries_policy_server_config(self):
+        deploy = load_deploy_config(get_deploy_config_path("cosmos3_policy_droid.yaml"))
+        assert deploy.pipeline == "cosmos3_policy"
+
+        stages = merge_pipeline_deploy(OMNI_PIPELINES["cosmos3_policy"], deploy)
+        assert len(stages) == 1
+        stage = stages[0].to_omegaconf()
+
+        assert stage.stage_type == "diffusion"
+        assert stage.final_output_type == "action"
+        assert stage.engine_args.model_class_name == "Cosmos3OmniDiffusersPipeline"
+        # OpenPI websocket handshake metadata must reach the serving layer via
+        # engine_args.model_config (ServingRealtimeRobotOpenPI reads it there).
+        psc = stage.engine_args.model_config.policy_server_config
+        assert list(psc.image_resolution) == [540, 640]
+        assert psc.n_external_cameras == 2
+        assert psc.needs_wrist_camera is True
+        assert psc.needs_stereo_camera is False
+        assert psc.needs_session_id is True
+        assert psc.action_space == "joint_position"
+        # The DROID checkpoint's training recipe expects JSON-formatted prompts.
+        assert stage.default_sampling_params.extra_args.format_prompt_as_json is True
+
+    def test_no_guardrails_cli_flag_keeps_policy_server_config(self):
+        """--no-guardrails becomes a partial model_config CLI override; it must
+        deep-merge with the deploy yaml's model_config, not clobber the
+        policy_server_config the OpenPI handshake depends on."""
+        deploy = load_deploy_config(get_deploy_config_path("cosmos3_policy_droid.yaml"))
+        stages, _ = StageConfigFactory._create_legacy_from_registry(
+            OMNI_PIPELINES["cosmos3_policy"],
+            {"model_config": {"guardrails": False}},
+            user_deploy_config=deploy,
+        )
+        stage = stages[0].to_omegaconf()
+        assert stage.engine_args.model_config.guardrails is False
+        assert stage.engine_args.model_config.policy_server_config.action_space == "joint_position"
+
+
 class TestStagePipelineConfig:
     def test_frozen(self):
         s = StagePipelineConfig(stage_id=0, model_stage="a")
@@ -932,6 +1003,44 @@ class TestPipelineRegistration:
         assert isinstance(omni_config, VllmOmniConfig)
         assert omni_config.stage_by_id(0).diffusion_config.model == "fake/model"
 
+    def test_cosyvoice3_deploy_resolves_hash_snapshot_without_hf_metadata(self, tmp_path):
+        snapshot = tmp_path / "models--FunAudioLLM--Fun-CosyVoice3-0.5B-2512" / "snapshots" / ("a" * 40)
+        snapshot.mkdir(parents=True)
+        (snapshot / "config.json").write_text("{}\n", encoding="utf-8")
+        model = str(snapshot)
+        deploy_path = get_deploy_config_path("cosyvoice3.yaml")
+
+        assert StageConfigFactory.try_infer_model_type(model, trust_remote_code=False) is None
+        assert StageConfigFactory.get_pipeline_config(model, trust_remote_code=False) is None
+
+        omni_config = StageConfigFactory.create_from_model(
+            model,
+            trust_remote_code=False,
+            cli_overrides={},
+            deploy_config_path=deploy_path,
+        )
+        legacy_configs, _ = StageConfigFactory.create_legacy_stage_configs_from_model(
+            model,
+            trust_remote_code=False,
+            cli_overrides={},
+            deploy_config_path=deploy_path,
+        )
+
+        assert omni_config is not None
+        assert omni_config.pipeline_config.model_type == "cosyvoice3"
+        assert [
+            (stage.stage_id, stage.stage_type, stage.worker_type, stage.model_stage)
+            for stage in omni_config.stage_configs
+        ] == [
+            (0, StageType.LLM, "ar", "cosyvoice3_talker"),
+            (1, StageType.LLM, "generation", "cosyvoice3_code2wav"),
+        ]
+        assert all(stage.model_config.model == model for stage in omni_config.stage_configs)
+        assert all(stage.stage_type is not StageType.DIFFUSION for stage in omni_config.stage_configs)
+
+        assert legacy_configs is not None
+        assert [stage.stage_type for stage in legacy_configs] == [StageType.LLM, StageType.LLM]
+
     def test_pipeline_registration(self, clean_pipeline_registry):
         """Ensure that we can register and create a custom pipeline config."""
         new_model_type = "new_model_type"
@@ -1223,6 +1332,10 @@ class TestDeployConfigLoading:
         assert deploy.duplex_session.max_sessions == max_sessions
         assert [stage.session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
         assert [stage.to_omegaconf().session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
+        assert stages[0].yaml_extras["default_sampling_params"]["stop_token_ids"] == [
+            151704,
+            151645,
+        ]
 
     def test_load_minicpmo_default_deploy_config(self):
         deploy_path = Path(get_deploy_config_path("minicpmo_4_5.yaml"))
@@ -2474,6 +2587,26 @@ class TestPlatformOverrides:
         assert rocm.stages[0].enforce_eager is None
         assert rocm.stages[1].enforce_eager is True
 
+    @pytest.mark.parametrize("deploy_name", ["qwen3_tts.yaml", "qwen3_tts_high_concurrency.yaml"])
+    @pytest.mark.parametrize("platform", ["cuda", "npu", "rocm"])
+    def test_qwen3_tts_default_code2wav_dtype_is_bf16(self, deploy_name, platform):
+        deploy = load_deploy_config(Path(get_deploy_config_path(deploy_name)))
+        deploy = _apply_platform_overrides(deploy, platform=platform)
+        stages = merge_pipeline_deploy(resolve_pipeline_config("qwen3_tts"), deploy)
+
+        assert stages[1].yaml_engine_args["dtype"] == "bfloat16"
+
+    @pytest.mark.parametrize("deploy_name", ["qwen3_tts.yaml", "qwen3_tts_high_concurrency.yaml"])
+    @pytest.mark.parametrize("platform", ["cuda", "npu"])
+    @pytest.mark.parametrize("dtype", ["float32", "bfloat16", "float16"])
+    def test_qwen3_tts_propagates_explicit_code2wav_dtype(self, deploy_name, platform, dtype):
+        deploy = load_deploy_config(Path(get_deploy_config_path(deploy_name)))
+        deploy.stages[1].engine_extras["dtype"] = dtype
+        deploy = _apply_platform_overrides(deploy, platform=platform)
+        stages = merge_pipeline_deploy(resolve_pipeline_config("qwen3_tts"), deploy)
+
+        assert stages[1].yaml_engine_args["dtype"] == dtype
+
     def test_higgs_audio_v3_rocm_uses_triton_attention(self):
         deploy_path = Path(get_deploy_config_path("higgs_multimodal_qwen3.yaml"))
 
@@ -3103,7 +3236,7 @@ class TestSentinelDefaultPrecedence:
 
 
 class TestSamplingConstraintsPrecedence:
-    """Test that pipeline sampling_constraints override deploy defaults."""
+    """Test scalar constraint precedence and additive required stop tokens."""
 
     def test_constraints_win(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
@@ -3122,6 +3255,47 @@ class TestSamplingConstraintsPrecedence:
         assert stages[0].yaml_extras["default_sampling_params"]["detokenize"] is True
         # Pipeline says stop_token_ids=[2150] for talker
         assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [2150]
+
+    def test_required_stop_tokens_extend_yaml_defaults(self, tmp_path):
+        pipeline = PipelineConfig(
+            model_type="required_stop_tokens",
+            stages=(
+                StagePipelineConfig(
+                    stage_id=0,
+                    model_stage="thinker",
+                    final_output=True,
+                    sampling_constraints={
+                        "detokenize": True,
+                        "stop_token_ids": [151704, 151645],
+                    },
+                ),
+            ),
+        )
+        deploy_path = tmp_path / "required-stop-tokens.yaml"
+        deploy_path.write_text(
+            """
+stages:
+  - stage_id: 0
+    default_sampling_params:
+      max_tokens: 7
+      stop_token_ids: [100, 151704]
+""",
+            encoding="utf-8",
+        )
+
+        legacy_stage = merge_pipeline_deploy(pipeline, load_deploy_config(deploy_path))[0]
+        structured_stage = VllmOmniConfig.from_pipeline_config(
+            pipeline,
+            deploy_config_path=str(deploy_path),
+        ).stage_by_id(0)
+        expected = {
+            "max_tokens": 7,
+            "detokenize": True,
+            "stop_token_ids": [100, 151704, 151645],
+        }
+
+        assert legacy_stage.yaml_extras["default_sampling_params"] == expected
+        assert structured_stage.model_config.default_sampling_params == expected
 
 
 class TestPipelineConfigResolvers:
