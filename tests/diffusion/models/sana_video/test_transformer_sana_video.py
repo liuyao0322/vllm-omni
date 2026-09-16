@@ -607,6 +607,79 @@ def test_paired_rope_disables_fusion_after_first_sight_mismatch(monkeypatch):
     assert all(torch.equal(actual, reference) for actual, reference in zip(second, expected, strict=True))
 
 
+@pytest.mark.parametrize("output_index", [0, 1])
+@pytest.mark.parametrize("table_dtype", [torch.bfloat16, torch.float32])
+def test_paired_rope_rejects_signed_zero_mismatch(monkeypatch, output_index, table_dtype):
+    import vllm_omni.diffusion.models.sana_video.transformer_sana_video as sana_video
+
+    query = torch.zeros(1, 3, 2, 12, dtype=torch.bfloat16)
+    key = torch.zeros_like(query)
+    cos = torch.ones(1, 3, 1, 12, dtype=table_dtype)
+    sin = torch.zeros_like(cos)
+    state = sana_video._SanaVideoRoPEFusionState()
+    reference = tuple(sana_video.apply_interleaved_rotary_emb(x, cos, sin) for x in (query, key))
+    calls = 0
+
+    def mismatched_fused(*_args):
+        nonlocal calls
+        calls += 1
+        outputs = tuple(x.clone() for x in reference)
+        outputs[output_index].flatten()[0] = -0.0
+        assert torch.equal(outputs[output_index], reference[output_index])
+        assert not torch.equal(outputs[output_index].view(torch.int16), reference[output_index].view(torch.int16))
+        return outputs
+
+    monkeypatch.setattr(sana_video, "_SANA_VIDEO_ROPE_FUSION_STATE", state)
+    monkeypatch.setattr(sana_video, "can_use_fused_interleaved_rope", lambda *_args: True)
+    monkeypatch.setattr(sana_video, "_can_verify_sana_video_rope", lambda: True)
+    monkeypatch.setattr(sana_video, "fused_interleaved_rope", mismatched_fused)
+    for _ in range(2):
+        result = sana_video.apply_interleaved_rotary_emb_pair(query, key, cos, sin)
+        assert all(torch.equal(a.view(torch.int16), b.view(torch.int16)) for a, b in zip(result, reference))
+    assert calls == 1
+    assert state.entry_for(query, cos).disabled
+    assert not state.entry_for(query, cos).verified
+
+
+@pytest.mark.parametrize("verified", [False, True])
+def test_paired_rope_oom_preserves_state_and_allows_retry(monkeypatch, verified):
+    import vllm_omni.diffusion.models.sana_video.transformer_sana_video as sana_video
+
+    query = torch.randn(1, 3, 2, 12, dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    cos = torch.randn(1, 3, 1, 12, dtype=torch.bfloat16)
+    sin = torch.randn_like(cos)
+    state = sana_video._SanaVideoRoPEFusionState()
+    reference = tuple(sana_video.apply_interleaved_rotary_emb(x, cos, sin) for x in (query, key))
+    monkeypatch.setattr(sana_video, "_SANA_VIDEO_ROPE_FUSION_STATE", state)
+    monkeypatch.setattr(sana_video, "can_use_fused_interleaved_rope", lambda *_args: True)
+    monkeypatch.setattr(sana_video, "_can_verify_sana_video_rope", lambda: True)
+    monkeypatch.setattr(sana_video, "fused_interleaved_rope", lambda *_args: reference)
+    if verified:
+        sana_video.apply_interleaved_rotary_emb_pair(query, key, cos, sin)
+    entry = state.entry_for(query, cos)
+    assert entry.verified is verified
+    oom = torch.OutOfMemoryError("synthetic temporary memory pressure")
+
+    def fail(*_args):
+        raise oom
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sana_video, "fused_interleaved_rope", fail)
+        patch.setattr(
+            sana_video, "apply_interleaved_rotary_emb", lambda *_args: pytest.fail("OOM must not fall back to eager")
+        )
+        with pytest.raises(torch.OutOfMemoryError) as exc_info:
+            sana_video.apply_interleaved_rotary_emb_pair(query, key, cos, sin)
+    assert exc_info.value is oom
+    assert entry.verified is verified
+    assert not entry.disabled
+    result = sana_video.apply_interleaved_rotary_emb_pair(query, key, cos, sin)
+    assert all(torch.equal(a.view(torch.int16), b.view(torch.int16)) for a, b in zip(result, reference))
+    assert entry.verified
+    assert not entry.disabled
+
+
 def test_paired_rope_disables_fusion_after_kernel_exception(monkeypatch):
     import vllm_omni.diffusion.models.sana_video.transformer_sana_video as sana_video
 

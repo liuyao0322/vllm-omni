@@ -144,6 +144,9 @@ def apply_interleaved_rotary_emb_pair(
     def run_fused(*, verify: bool) -> tuple[torch.Tensor, torch.Tensor]:
         try:
             fused = fused_interleaved_rope(query, key, freqs_cos, freqs_sin)
+        except torch.OutOfMemoryError:
+            # Temporary memory pressure does not invalidate the fused variant.
+            raise
         except Exception as exc:
             if torch.compiler.is_compiling():
                 raise
@@ -155,7 +158,11 @@ def apply_interleaved_rotary_emb_pair(
             return fused
 
         reference = eager()
-        if torch.equal(fused[0], reference[0]) and torch.equal(fused[1], reference[1]):
+        # The fused path supports BF16 outputs; compare their raw payloads so
+        # signed zero and NaN bit patterns are part of the numerical contract.
+        if torch.equal(fused[0].view(torch.int16), reference[0].view(torch.int16)) and torch.equal(
+            fused[1].view(torch.int16), reference[1].view(torch.int16)
+        ):
             entry.verified = True
             return fused
         entry.disable()
