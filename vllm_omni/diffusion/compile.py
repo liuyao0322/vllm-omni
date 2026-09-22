@@ -36,6 +36,10 @@ def regionally_compile(
     """
     Apply regional compilation to a PyTorch model.
 
+    Models may set ``_regional_compile_blocks_attrs`` to override the container
+    fallback from ``_layerwise_offload_blocks_attrs``. An empty list limits
+    compilation to the classes declared in ``_repeated_blocks``.
+
     Args:
         model: The PyTorch model instance to compile
         *compile_args: Positional arguments forwarded to torch.compile
@@ -54,7 +58,9 @@ def regionally_compile(
         logger.warning("Regional compilation skipped because the model does not define `_repeated_blocks`.")
         return model
 
-    repeated_block_attrs = getattr(model, "_layerwise_offload_blocks_attrs", [])
+    repeated_block_attrs = getattr(
+        model, "_regional_compile_blocks_attrs", getattr(model, "_layerwise_offload_blocks_attrs", [])
+    )
 
     # Some repeated regions require model-specific Inductor options to retain
     # their eager numerical contract. Keep those defaults next to the model

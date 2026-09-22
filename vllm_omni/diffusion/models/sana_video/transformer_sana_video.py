@@ -1054,6 +1054,8 @@ class SanaVideoTransformer3DModel(nn.Module):
     # Compile only the convolutional feed-forward region and preserve the
     # explicit BF16 cast boundaries required to match eager numerics.
     _repeated_blocks: ClassVar[list[str]] = ["GLUMBTempConv"]
+    # Offloading uses whole transformer blocks; compilation targets only GLUMB.
+    _regional_compile_blocks_attrs: ClassVar[list[str]] = []
     _regional_compile_inductor_options: ClassVar[dict[str, bool]] = {"emulate_precision_casts": True}
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
