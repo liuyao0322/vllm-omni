@@ -170,6 +170,8 @@ def can_use_fused_interleaved_rope(
         and q.device == k.device == cos.device == sin.device
         and k.shape == q.shape
         and all(size > 0 for size in q.shape)
+        # Kernel element offsets use signed int32 arithmetic.
+        and q.numel() < 2**31
         and q.shape[-1] % 2 == 0
         and q.is_contiguous()
         and k.is_contiguous()

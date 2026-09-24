@@ -72,8 +72,8 @@ def test_fused_interleaved_rope_is_bit_exact(
 
     q_out, k_out = fused_interleaved_rope(q, k, cos, sin)
 
-    assert torch.equal(q_out, _reference(q, cos, sin))
-    assert torch.equal(k_out, _reference(k, cos, sin))
+    assert torch.equal(q_out.view(torch.int16), _reference(q, cos, sin).view(torch.int16))
+    assert torch.equal(k_out.view(torch.int16), _reference(k, cos, sin).view(torch.int16))
     assert q_out.is_contiguous()
     assert k_out.is_contiguous()
     assert q_out.data_ptr() not in (q.data_ptr(), k.data_ptr())
@@ -102,10 +102,11 @@ def test_fused_interleaved_rope_preserves_bfloat16_intermediate_rounding():
     q_out, k_out = fused_interleaved_rope(q, k, cos, sin)
 
     assert torch.equal(q_out, q_reference)
-    assert torch.equal(k_out, _reference(k, cos, sin))
+    assert torch.equal(k_out.view(torch.int16), _reference(k, cos, sin).view(torch.int16))
 
 
-def test_fused_interleaved_rope_preserves_special_value_classes():
+@pytest.mark.parametrize("table_dtype", [torch.bfloat16, torch.float32])
+def test_fused_interleaved_rope_preserves_special_value_classes(table_dtype):
     from vllm_omni.diffusion.layers.fused_interleaved_rope import (
         fused_interleaved_rope,
     )
@@ -130,8 +131,8 @@ def test_fused_interleaved_rope_preserves_special_value_classes():
     ]
     q = torch.tensor(values, dtype=torch.bfloat16, device="cuda").reshape(1, 1, 1, -1)
     k = q.flip(-1).contiguous()
-    cos = torch.zeros_like(q)
-    sin = torch.zeros_like(q)
+    cos = torch.zeros_like(q, dtype=table_dtype)
+    sin = torch.zeros_like(cos)
     cos[..., 0::2] = 1
 
     q_out, k_out = fused_interleaved_rope(q, k, cos, sin)
@@ -202,3 +203,106 @@ def test_fused_interleaved_rope_predicate_rejects_unsupported_inputs():
 
     q_requires_grad = q.detach().requires_grad_()
     assert not can_use_fused_interleaved_rope(q_requires_grad, k, cos, sin)
+
+
+@pytest.mark.parametrize("numel", [2**31 - 2, 2**31, 2**31 + 2])
+def test_fused_interleaved_rope_int32_index_limit(numel):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from vllm_omni.diffusion.layers.fused_interleaved_rope import can_use_fused_interleaved_rope
+
+    # Exercise the boundary without allocating multi-gigabyte tensors.
+    with FakeTensorMode():
+        q = torch.empty(1, numel // 2, 1, 2, device="cuda", dtype=torch.bfloat16)
+        assert can_use_fused_interleaved_rope(q, q, q, q) == (numel < 2**31)
+
+
+@pytest.fixture
+def single_process_tp(tmp_path):
+    from vllm.distributed.parallel_state import (
+        cleanup_dist_env_and_memory,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+
+    init_distributed_environment(
+        world_size=1,
+        rank=0,
+        local_rank=0,
+        distributed_init_method=f"file://{tmp_path / 'dist_init'}",
+    )
+    initialize_model_parallel()
+    try:
+        yield
+    finally:
+        cleanup_dist_env_and_memory()
+
+
+@pytest.mark.parametrize("table_dtype", [torch.bfloat16, torch.float32])
+@torch.inference_mode()
+def test_linear_attention_uses_fused_rope_with_real_tables(monkeypatch, single_process_tp, table_dtype):
+    import vllm_omni.diffusion.models.sana_video.transformer_sana_video as sana_video
+
+    attention = (
+        sana_video.SanaLinearAttention(
+            dim=24, num_heads=2, head_dim=12, dropout=0.0, bias=True, qk_norm="rms_norm_across_heads"
+        )
+        .to(device="cuda", dtype=torch.bfloat16)
+        .eval()
+    )
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    # Parallel linear layers allocate uninitialized weights before loading.
+    for parameter in attention.parameters():
+        parameter.normal_(std=0.1, generator=generator)
+    rope = sana_video.WanRotaryPosEmbed(12, (1, 2, 2), 32).to(device="cuda", dtype=table_dtype)
+    rotary_emb = rope(torch.empty(1, 4, 3, 4, 4, device="cuda", dtype=torch.bfloat16))
+    hidden_states = torch.randn(1, 12, 24, device="cuda", dtype=torch.bfloat16, generator=generator)
+    original_fused = sana_video.fused_interleaved_rope
+    fused_calls = 0
+
+    def counting_fused(*args):
+        nonlocal fused_calls
+        fused_calls += 1
+        return original_fused(*args)
+
+    monkeypatch.setattr(sana_video, "fused_interleaved_rope", counting_fused)
+    # Keep the real support predicate: incompatible production tables must fail
+    # the dispatch assertion even if eager fallback still produces correct output.
+    actual = attention(hidden_states, rotary_emb=rotary_emb)
+    assert fused_calls == 1
+
+    def eager_pair(q, k, cos, sin):
+        return _reference(q, cos, sin), _reference(k, cos, sin)
+
+    monkeypatch.setattr(sana_video, "apply_interleaved_rotary_emb_pair", eager_pair)
+    expected = attention(hidden_states, rotary_emb=rotary_emb)
+    assert torch.isfinite(expected).all()
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.parametrize("table_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("execution", ["compile", "cuda_graph"])
+def test_paired_rope_compile_and_capture(table_dtype, execution):
+    from vllm_omni.diffusion.models.sana_video.transformer_sana_video import apply_interleaved_rotary_emb_pair
+
+    q = torch.randn(1, 17, 3, 12, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    cos = torch.randn(1, 17, 1, 12, device="cuda", dtype=table_dtype)
+    sin = torch.randn_like(cos)
+    expected = (_reference(q, cos, sin), _reference(k, cos, sin))
+    if execution == "compile":
+        compiled = torch.compile(apply_interleaved_rotary_emb_pair, fullgraph=True)
+        actual = compiled(q, k, cos, sin)
+    else:
+        # Warm up the kernel on a side stream before CUDA Graph capture.
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            apply_interleaved_rotary_emb_pair(q, k, cos, sin)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = apply_interleaved_rotary_emb_pair(q, k, cos, sin)
+        graph.replay()
+    for result, reference in zip(actual, expected):
+        assert torch.equal(result.view(torch.int16), reference.view(torch.int16))

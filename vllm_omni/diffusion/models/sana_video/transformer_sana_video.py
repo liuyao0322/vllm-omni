@@ -17,7 +17,6 @@
 
 import math
 import numbers
-import threading
 from collections.abc import Iterable
 from dataclasses import dataclass, fields
 
@@ -30,7 +29,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.model_executor.utils import set_weight_attrs
@@ -47,8 +45,6 @@ from vllm_omni.diffusion.layers.fused_interleaved_rope import (
     can_use_fused_interleaved_rope,
     fused_interleaved_rope,
 )
-
-logger = init_logger(__name__)
 
 
 def validate_sana_video_parallel_config(parallel_config) -> None:
@@ -111,53 +107,6 @@ def _sp_gather_frames(hidden_states: torch.Tensor, sizes: list[int]) -> torch.Te
     return torch.cat([part.narrow(1, 0, size) for part, size in zip(parts, sizes)], dim=1).flatten(1, 2)
 
 
-class _SanaVideoRoPEFusionEntry:
-    def __init__(self) -> None:
-        self.verified = False
-        self.disabled = False
-        self.verification_lock = threading.Lock()
-
-    def disable(self) -> None:
-        self.verified = False
-        self.disabled = True
-
-
-class _SanaVideoRoPEFusionState:
-    """Process-local first-sight state for each compiled arithmetic variant."""
-
-    def __init__(self) -> None:
-        self._entries: dict[tuple[torch.device, torch.dtype, int, int], _SanaVideoRoPEFusionEntry] = {}
-        self._entries_lock = threading.Lock()
-        self._unverified_entry = _SanaVideoRoPEFusionEntry()
-
-    def entry_for(
-        self,
-        query: torch.Tensor,
-        freqs_cos: torch.Tensor,
-    ) -> _SanaVideoRoPEFusionEntry:
-        # Sequence length is a non-specialized runtime kernel argument. Device,
-        # table dtype, heads, and head dimension still select distinct Triton
-        # variants, so each gets independent verification and JIT warmup.
-        key = (query.device, freqs_cos.dtype, query.shape[2], query.shape[3])
-        entry = self._entries.get(key)
-        if entry is not None:
-            return entry
-        if torch.compiler.is_compiling():
-            # Dynamo cannot enter a Python lock in a full graph.  Compilation
-            # is read-only: a prewarmed key selects fused, while an unseen key
-            # receives this immutable-in-practice sentinel and stays eager.
-            return self._unverified_entry
-        with self._entries_lock:
-            entry = self._entries.get(key)
-            if entry is None:
-                entry = _SanaVideoRoPEFusionEntry()
-                self._entries[key] = entry
-            return entry
-
-
-_SANA_VIDEO_ROPE_FUSION_STATE = _SanaVideoRoPEFusionState()
-
-
 def apply_interleaved_rotary_emb(
     hidden_states: torch.Tensor,
     freqs_cos: torch.Tensor,
@@ -173,74 +122,19 @@ def apply_interleaved_rotary_emb(
     return output.type_as(hidden_states)
 
 
-def _can_verify_sana_video_rope() -> bool:
-    if torch.compiler.is_compiling():
-        return False
-    return not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
-
-
 def apply_interleaved_rotary_emb_pair(
     query: torch.Tensor,
     key: torch.Tensor,
     freqs_cos: torch.Tensor,
     freqs_sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply paired RoPE with first-sight bit-exact verification and fallback."""
-
-    def eager() -> tuple[torch.Tensor, torch.Tensor]:
-        return (
-            apply_interleaved_rotary_emb(query, freqs_cos, freqs_sin),
-            apply_interleaved_rotary_emb(key, freqs_cos, freqs_sin),
-        )
-
-    supported = can_use_fused_interleaved_rope(query, key, freqs_cos, freqs_sin)
-    if not supported:
-        return eager()
-
-    entry = _SANA_VIDEO_ROPE_FUSION_STATE.entry_for(query, freqs_cos)
-    if entry.disabled:
-        return eager()
-
-    def run_fused(*, verify: bool) -> tuple[torch.Tensor, torch.Tensor]:
-        try:
-            fused = fused_interleaved_rope(query, key, freqs_cos, freqs_sin)
-        except torch.OutOfMemoryError:
-            # Temporary memory pressure does not invalidate the fused variant.
-            raise
-        except Exception as exc:
-            if torch.compiler.is_compiling():
-                raise
-            entry.disable()
-            logger.warning_once("Disabling SANA-Video fused RoPE fast path: %s", exc)
-            return eager()
-
-        if not verify:
-            return fused
-
-        reference = eager()
-        # The fused path supports BF16 outputs; compare their raw payloads so
-        # signed zero and NaN bit patterns are part of the numerical contract.
-        if torch.equal(fused[0].view(torch.int16), reference[0].view(torch.int16)) and torch.equal(
-            fused[1].view(torch.int16), reference[1].view(torch.int16)
-        ):
-            entry.verified = True
-            return fused
-        entry.disable()
-        logger.warning_once("SANA-Video fused RoPE is not bit-exact on this platform; falling back to eager")
-        return reference
-
-    if entry.verified:
-        return run_fused(verify=False)
-    if not _can_verify_sana_video_rope():
-        return eager()
-
-    # Only the first eligible request for a device/table-dtype pair pays for
-    # JIT plus eager comparison.  Concurrent requests wait and then use the
-    # already verified (or permanently disabled) result.
-    with entry.verification_lock:
-        if entry.disabled:
-            return eager()
-        return run_fused(verify=not entry.verified)
+    """Apply fused paired RoPE when supported, otherwise use eager RoPE."""
+    if can_use_fused_interleaved_rope(query, key, freqs_cos, freqs_sin):
+        return fused_interleaved_rope(query, key, freqs_cos, freqs_sin)
+    return (
+        apply_interleaved_rotary_emb(query, freqs_cos, freqs_sin),
+        apply_interleaved_rotary_emb(key, freqs_cos, freqs_sin),
+    )
 
 
 @dataclass
