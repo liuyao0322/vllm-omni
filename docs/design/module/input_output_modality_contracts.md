@@ -219,6 +219,24 @@ silently run through the independent-request path. Word timestamps also require
 the deployment's forced aligner. `split_granularity` must be `none` when using
 commitment; the separate linguistic splitter remains available in buffered mode.
 
+The transport consumes the `StreamingTextFrontend` protocol: synchronous
+`feed(text)` and `finish()` return ordered, irreversible synthesis segments.
+Each frontend owns commitment scanning and segment assembly; the handler only
+stages those segments and manages transport, bounded queues, cancellation, and
+generation. A `ValueError` fails the utterance without submitting any output
+from that call. EOF flushes the frontend once; cancellation discards its state.
+
+`TextCommitmentCapabilities.profile` selects a factory through
+`get_streaming_text_frontend_factory`. The factory receives the session language
+and pending-character limit and creates fresh state per utterance. Register a
+new versioned profile with `register_streaming_text_frontend` at startup, then
+advertise that profile and its supported behavior on the adapter. Unknown and
+duplicate profiles are rejected. The built-in `zh_en_special_v1` factory wraps
+the existing raw-source policy in `CommitmentTextFrontend`; a future TN/CAPS
+composition can implement the same protocol without changing the WebSocket
+handler. Frontends must not block, synthesize audio, or own external resources;
+the existing independent-segment capability restrictions still apply.
+
 Independent requests repeat prefill and incur per-segment scheduling and cleanup
 costs. They can introduce audible prosody discontinuities; M1 does not promise
 long-form acoustic continuity. Use the default buffered mode without splitting

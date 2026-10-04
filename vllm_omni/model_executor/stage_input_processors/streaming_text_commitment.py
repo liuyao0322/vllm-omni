@@ -620,7 +620,38 @@ class StreamingTextCommitmentPolicy:
         return self.feed("", final=True)
 
 
+class CommitmentTextFrontend:
+    """Assemble raw M1 synthesis segments only at policy-confirmed boundaries."""
+
+    def __init__(self, *, max_pending_chars: int = 4096) -> None:
+        self._policy = StreamingTextCommitmentPolicy(max_pending_chars=max_pending_chars)
+        self._segment_parts: list[str] = []
+
+    def feed(self, text: str) -> tuple[str, ...]:
+        return self._assemble(self._policy.feed(text))
+
+    def finish(self) -> tuple[str, ...]:
+        return self._assemble(self._policy.finish())
+
+    def _assemble(self, update: CommitmentUpdate) -> tuple[str, ...]:
+        segments: list[str] = []
+        for span in update.spans:
+            self._segment_parts.append(span.source_text)
+            if span.boundary_after:
+                self._flush_segment(segments)
+        if update.final:
+            self._flush_segment(segments)
+        return tuple(segments)
+
+    def _flush_segment(self, segments: list[str]) -> None:
+        text = "".join(self._segment_parts)
+        self._segment_parts.clear()
+        if text.strip():
+            segments.append(text)
+
+
 __all__ = (
+    "CommitmentTextFrontend",
     "CommittedTextSpan",
     "CommitmentState",
     "CommitmentUpdate",

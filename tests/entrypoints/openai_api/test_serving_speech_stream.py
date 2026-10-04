@@ -20,7 +20,9 @@ from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.tts_adapters.base import TTSModelAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter
+from vllm_omni.model_executor.stage_input_processors import streaming_text_frontend as frontend_module
 from vllm_omni.model_executor.stage_input_processors.forced_aligner import ALIGNER_WORDS_KEY
+from vllm_omni.model_executor.stage_input_processors.streaming_text_commitment import CommitmentTextFrontend
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -128,6 +130,124 @@ class TestStreamingSpeechWebSocket:
 
     def test_text_input_mode_defaults_to_buffered(self):
         assert streaming_speech_module.StreamingSpeechSessionConfig().text_input_mode == "buffered"
+
+    def test_registered_frontend_controls_segments_and_is_fresh_per_utterance(self, monkeypatch, mocker):
+        monkeypatch.setattr(frontend_module, "_FRONTEND_FACTORIES", frontend_module._FRONTEND_FACTORIES.copy())
+        configs = []
+        instances = []
+
+        class CustomFrontend:
+            def __init__(self):
+                self.pending = ""
+
+            def feed(self, text):
+                # A stand-in for a composed frontend: normalize and decide its
+                # own boundaries, independent of the built-in M1 scanner.
+                self.pending += text
+                *ready, self.pending = self.pending.split("|")
+                return tuple(segment.upper() for segment in ready)
+
+            def finish(self):
+                result = (self.pending.upper(),) if self.pending else ()
+                self.pending = ""
+                return result
+
+        def factory(config):
+            configs.append(config)
+            frontend = CustomFrontend()
+            instances.append(frontend)
+            return frontend
+
+        frontend_module.register_streaming_text_frontend("custom_v1", factory)
+        app, speech_service = _build_test_app(mocker=mocker, commitment_supported=True)
+        speech_service._get_tts_adapter.return_value.text_commitment = replace(
+            Qwen3TTSAdapter.text_commitment, profile="custom_v1"
+        )
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json({"type": "session.config", "language": "English", "text_input_mode": "commitment"})
+                ws.send_json({"type": "input.text", "text": "one.two|three|tail"})
+                for index, expected in enumerate(("ONE.TWO", "THREE")):
+                    start = ws.receive_json()
+                    assert start["sentence_text"] == expected
+                    assert start["sentence_index"] == index
+                    ws.receive_bytes()
+                    assert ws.receive_json()["type"] == "audio.done"
+                ws.send_json({"type": "input.done"})
+                assert ws.receive_json()["sentence_text"] == "TAIL"
+                ws.receive_bytes()
+                assert ws.receive_json()["type"] == "audio.done"
+                assert ws.receive_json() == {"type": "session.done", "utterance_index": 0, "total_sentences": 3}
+
+                ws.send_json({"type": "input.text", "text": "next"})
+                ws.send_json({"type": "input.done"})
+                start = ws.receive_json()
+                assert start["sentence_text"] == "NEXT"
+                assert start["sentence_index"] == 0
+                assert start["utterance_index"] == 1
+                ws.receive_bytes()
+                assert ws.receive_json()["type"] == "audio.done"
+                assert ws.receive_json() == {"type": "session.done", "utterance_index": 1, "total_sentences": 1}
+
+        assert len(instances) == 2 and instances[0] is not instances[1]
+        assert (
+            configs
+            == [
+                frontend_module.StreamingTextFrontendConfig(
+                    language="English", max_pending_chars=streaming_speech_module._MAX_COMMITMENT_PENDING_CHARS
+                )
+            ]
+            * 2
+        )
+        assert [call.args[0].input for call in speech_service._generate_audio_bytes.await_args_list] == [
+            "ONE.TWO",
+            "THREE",
+            "TAIL",
+            "NEXT",
+        ]
+
+    def test_buffered_mode_does_not_resolve_a_streaming_frontend(self, mocker):
+        factory_lookup = mocker.patch.object(streaming_speech_module, "get_streaming_text_frontend_factory")
+        app, _ = _build_test_app(mocker=mocker, commitment_supported=True)
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json({"type": "session.config"})
+                ws.send_json({"type": "input.text", "text": "buffered"})
+                ws.send_json({"type": "input.done"})
+                assert ws.receive_json()["sentence_text"] == "buffered"
+                ws.receive_bytes()
+                assert ws.receive_json()["type"] == "audio.done"
+                assert ws.receive_json()["type"] == "session.done"
+        factory_lookup.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["feed", "finish"])
+    async def test_frontend_failure_discards_queued_work_and_reports_before_eof(self, mocker, operation):
+        frontend = mocker.Mock(spec=frontend_module.StreamingTextFrontend)
+        getattr(frontend, operation).side_effect = ValueError("frontend rejected input")
+        handler = OmniStreamingSpeechHandler(speech_service=mocker.MagicMock())
+        websocket = mocker.MagicMock(spec=WebSocket)
+        websocket.send_json = mocker.AsyncMock()
+        state = streaming_speech_module._CommitmentUtterance(
+            index=0, config=streaming_speech_module.StreamingSpeechSessionConfig(), frontend=frontend
+        )
+        state.ingress.put_nowait("staged")
+        state.queue.put_nowait("queued")
+
+        if operation == "feed":
+            await handler._feed_commitment_text(websocket, state, "invalid")
+            frontend.finish.assert_not_called()
+        await handler._finish_commitment_utterance(websocket, state)
+
+        assert state.failed and state.eof
+        websocket.send_json.assert_awaited_once_with({"type": "error", "message": "frontend rejected input"})
+        assert state.queue.empty()
+        assert state.ingress.get_nowait() is streaming_speech_module._UTTERANCE_EOF
+        assert state.ingress.empty()
+        state.ingress.task_done()
+        await asyncio.wait_for(state.ingress.join(), timeout=1)
+        await asyncio.wait_for(state.queue.join(), timeout=1)
 
     def test_text_input_mode_accepts_commitment(self):
         assert (
@@ -309,11 +429,11 @@ class TestStreamingSpeechWebSocket:
         state = streaming_speech_module._CommitmentUtterance(
             index=0,
             config=streaming_speech_module.StreamingSpeechSessionConfig(),
+            frontend=CommitmentTextFrontend(),
             queue=asyncio.Queue(maxsize=1),
         )
         state.queue.put_nowait("first")
-        state.segment_parts.append("second!")
-        handler._enqueue_commitment_segment(state)
+        handler._enqueue_commitment_segments(state, ("second!",))
 
         producer = asyncio.create_task(handler._commitment_segment_producer(state))
         await asyncio.sleep(0)
@@ -384,8 +504,8 @@ class TestStreamingSpeechWebSocket:
 
         original_finish = handler._finish_commitment_utterance
 
-        def observe_finish(state):
-            original_finish(state)
+        async def observe_finish(websocket, state):
+            await original_finish(websocket, state)
             input_done_processed.set()
 
         mocker.patch.object(handler, "_finish_commitment_utterance", side_effect=observe_finish)
@@ -451,6 +571,7 @@ class TestStreamingSpeechWebSocket:
         state = streaming_speech_module._CommitmentUtterance(
             index=0,
             config=streaming_speech_module.StreamingSpeechSessionConfig(),
+            frontend=CommitmentTextFrontend(),
         )
         state.queue.put_nowait("work")
 
@@ -499,6 +620,7 @@ class TestStreamingSpeechWebSocket:
         state = streaming_speech_module._CommitmentUtterance(
             index=0,
             config=streaming_speech_module.StreamingSpeechSessionConfig(),
+            frontend=CommitmentTextFrontend(),
             eof=True,
         )
 

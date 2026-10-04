@@ -204,6 +204,7 @@ class TextCommitmentCapabilities:
     stateful adapter must use a handler that implements its lifecycle contract.
     """
 
+    #: Versioned key resolved by the streaming text frontend factory registry.
     profile: str
     languages: frozenset[str]
     independent_segments: bool

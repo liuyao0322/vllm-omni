@@ -60,6 +60,7 @@ import json
 import time
 from contextlib import aclosing
 from dataclasses import dataclass, field
+from typing import cast
 
 from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
@@ -72,9 +73,10 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
 )
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.speech_text_splitter import SpeechTextSplitter
-from vllm_omni.model_executor.stage_input_processors.streaming_text_commitment import (
-    CommitmentUpdate,
-    StreamingTextCommitmentPolicy,
+from vllm_omni.model_executor.stage_input_processors.streaming_text_frontend import (
+    StreamingTextFrontend,
+    StreamingTextFrontendConfig,
+    get_streaming_text_frontend_factory,
 )
 from vllm_omni.utils.forced_aligner import extract_word_timestamps
 
@@ -122,10 +124,8 @@ class _CommitmentUtterance:
 
     index: int
     config: StreamingSpeechSessionConfig
-    policy: StreamingTextCommitmentPolicy = field(
-        default_factory=lambda: StreamingTextCommitmentPolicy(max_pending_chars=_MAX_COMMITMENT_PENDING_CHARS)
-    )
-    # Policy updates are staged here without awaiting so bounded synthesis
+    frontend: StreamingTextFrontend
+    # Frontend segments are staged here without awaiting so bounded synthesis
     # backpressure never blocks the sole WebSocket receive loop. The existing
     # utterance character limit bounds the total memory retained by this
     # otherwise unbounded ingress queue.
@@ -133,7 +133,6 @@ class _CommitmentUtterance:
     queue: asyncio.Queue[str | object] = field(
         default_factory=lambda: asyncio.Queue(maxsize=_MAX_COMMITMENT_QUEUE_SIZE)
     )
-    segment_parts: list[str] = field(default_factory=list)
     input_chars: int = 0
     started_sentences: int = 0
     failed: bool = False
@@ -305,7 +304,7 @@ class OmniStreamingSpeechHandler:
                                 }
                             )
                         else:
-                            self._finish_commitment_utterance(commitment)
+                            await self._finish_commitment_utterance(websocket, commitment)
                         utterance_index += 1
                         continue
 
@@ -404,7 +403,7 @@ class OmniStreamingSpeechHandler:
             raw = await asyncio.wait_for(receive_task, timeout=timeout)
             return raw, worker_finished
         finally:
-            helper_tasks = [receive_task]
+            helper_tasks: list[asyncio.Task[str] | asyncio.Task[None]] = [receive_task]
             if join_task is not None:
                 helper_tasks.append(join_task)
             for task in helper_tasks:
@@ -430,7 +429,20 @@ class OmniStreamingSpeechHandler:
         config: StreamingSpeechSessionConfig,
         utterance_index: int,
     ) -> _CommitmentUtterance:
-        state = _CommitmentUtterance(index=utterance_index, config=config)
+        adapter = self._speech_service._get_tts_adapter()
+        assert adapter is not None and adapter.text_commitment is not None
+        assert config.language is not None
+        factory = get_streaming_text_frontend_factory(adapter.text_commitment.profile)
+        state = _CommitmentUtterance(
+            index=utterance_index,
+            config=config,
+            frontend=factory(
+                StreamingTextFrontendConfig(
+                    language=config.language,
+                    max_pending_chars=_MAX_COMMITMENT_PENDING_CHARS,
+                )
+            ),
+        )
         state.producer = asyncio.create_task(self._commitment_segment_producer(state))
         state.consumer = asyncio.create_task(self._commitment_worker(websocket, state))
         state.worker = asyncio.create_task(self._commitment_lifecycle(websocket, state))
@@ -459,50 +471,36 @@ class OmniStreamingSpeechHandler:
             return
 
         try:
-            update = state.policy.feed(text)
+            segments = state.frontend.feed(text)
         except ValueError as exc:
             await self._fail_commitment_input(websocket, state, str(exc))
             return
-        self._enqueue_commitment_update(state, update)
+        self._enqueue_commitment_segments(state, segments)
 
-    def _finish_commitment_utterance(self, state: _CommitmentUtterance) -> None:
+    async def _finish_commitment_utterance(self, websocket: WebSocket, state: _CommitmentUtterance) -> None:
         if state.eof:
             return
         state.eof = True
         if not state.failed:
             try:
-                self._enqueue_commitment_update(state, state.policy.finish())
-                self._enqueue_commitment_segment(state)
-            except ValueError:
-                # The pending-size failure is reported by feed(), before EOF;
-                # this is defensive for a custom policy/normalizer failure.
-                state.failed = True
-                self._drop_queued_segments(state)
+                self._enqueue_commitment_segments(state, state.frontend.finish())
+            except ValueError as exc:
+                # A composed frontend may discover invalid input during its
+                # EOF flush. Report it before forwarding EOF/session.done.
+                await self._fail_commitment_input(websocket, state, str(exc))
         state.ingress.put_nowait(_UTTERANCE_EOF)
 
-    def _enqueue_commitment_update(
-        self,
-        state: _CommitmentUtterance,
-        update: CommitmentUpdate,
-    ) -> None:
-        """Segment only on boundaries already decided by the policy.
-
-        In particular, this layer never scans punctuation again. That would
-        recreate packet-seam ambiguity for decimal points and abbreviations.
-        """
-        for span in update.spans:
-            state.segment_parts.append(span.source_text)
-            if span.boundary_after:
-                self._enqueue_commitment_segment(state)
-
     @staticmethod
-    def _enqueue_commitment_segment(state: _CommitmentUtterance) -> None:
-        sentence = "".join(state.segment_parts)
-        state.segment_parts.clear()
-        if sentence.strip() and not state.failed:
-            # The independent producer absorbs bounded-queue backpressure so
-            # control frames remain readable by the transport receive loop.
-            state.ingress.put_nowait(sentence)
+    def _enqueue_commitment_segments(
+        state: _CommitmentUtterance,
+        segments: tuple[str, ...],
+    ) -> None:
+        """Stage complete frontend segments without interpreting their text."""
+        if not state.failed:
+            for segment in segments:
+                # The independent producer absorbs bounded-queue backpressure
+                # so control frames remain readable by the receive loop.
+                state.ingress.put_nowait(segment)
 
     async def _fail_commitment_input(
         self,
@@ -513,7 +511,6 @@ class OmniStreamingSpeechHandler:
         if state.failed:
             return
         state.failed = True
-        state.segment_parts.clear()
         self._drop_queued_segments(state)
         await self._send_error(websocket, message)
 
@@ -763,8 +760,6 @@ class OmniStreamingSpeechHandler:
             unsupported = None
             if config.split_granularity != "none":
                 unsupported = "split_granularity must be 'none' in commitment mode"
-            elif capability.profile != "zh_en_special_v1":
-                unsupported = f"unsupported commitment profile: {capability.profile!r}"
             elif not capability.independent_segments or capability.preserves_cross_segment_context:
                 unsupported = "M1 supports independent segments without cross-segment state only"
             elif capability.retry_failed_segments:
@@ -775,6 +770,11 @@ class OmniStreamingSpeechHandler:
                 unsupported = "the commitment adapter does not support word timestamps"
             if unsupported is not None:
                 await self._send_error(websocket, unsupported)
+                return None
+            try:
+                get_streaming_text_frontend_factory(capability.profile)
+            except ValueError as exc:
+                await self._send_error(websocket, str(exc))
                 return None
 
         return config
@@ -911,6 +911,9 @@ class OmniStreamingSpeechHandler:
                     request_id=request_id,
                     request_arrival_ts=request_arrival_ts,
                 )
+                # This call leaves base64_encode=False, so the serving helper
+                # returns bytes rather than its optional base64 string form.
+                audio_bytes = cast(bytes, audio_bytes)
                 total_bytes = len(audio_bytes)
                 await websocket.send_bytes(audio_bytes)
         except WebSocketDisconnect:
