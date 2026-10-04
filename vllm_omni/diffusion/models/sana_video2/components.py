@@ -13,6 +13,7 @@
 # limitations under the License.
 #
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Embedding and normalization contracts from the pinned SANA-Video 2.0 release.
 
@@ -62,7 +63,7 @@ class RMSNorm(torch.nn.Module):
         """
         return x * torch.rsqrt(x.pow(2).mean(self.norm_dim, keepdim=True) + self.eps)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through the RMSNorm layer.
 
