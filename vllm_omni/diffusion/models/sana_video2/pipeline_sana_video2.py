@@ -8,7 +8,6 @@ from pathlib import Path
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
-from huggingface_hub import snapshot_download
 from PIL import Image
 from torch import nn
 from transformers import AutoModel, AutoTokenizer
@@ -19,6 +18,7 @@ from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComp
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.request import resolve_video_num_frames
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 from .conditioning import (
     DEFAULT_NEGATIVE_PROMPT,
@@ -163,7 +163,7 @@ class SanaVideo2Pipeline(nn.Module, SupportImageInput, SupportsComponentDiscover
         root = Path(config.model)
         if not root.is_dir():
             root = Path(
-                snapshot_download(
+                hf_api().snapshot_download(
                     config.model,
                     revision=config.revision or (MODEL_REVISION if config.model == MODEL_ID else None),
                     allow_patterns=["config.yaml", "checkpoints/SANA_Video_2.0_5B_720p.pth"],
