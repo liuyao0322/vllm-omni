@@ -11,8 +11,12 @@ they cannot replace that expression without changing model output.
 This CUDA fast path leaves aten's reduction and ``rsqrt`` untouched.  It
 only fuses the two bandwidth-heavy pointwise regions around them:
 
-* BF16-to-FP32 conversion plus squaring before ``aten::mean``;
+* BF16-to-FP32 conversion plus squaring before ``aten::mean`` or ``aten::sum``;
 * normalization, the explicit BF16 rounding point, and weight multiplication.
+
+The mean variant serves SanaRMSNorm.  The sum/count variant serves the video
+Q/K SanaDistributedRMSNorm at TP=1, retaining its FP32 sum and division rather
+than substituting a mean reduction.  TP>1 stays on the model's original path.
 
 The first eligible input signature is compared bit-for-bit with the eager
 expression.  A mismatch or non-OOM launch failure permanently disables that
@@ -34,12 +38,16 @@ logger = init_logger(__name__)
 
 _BLOCK_SIZE = 1024
 # The [2, 300, 2240] text norms are launch-bound and slightly faster in eager
-# mode; every supported SANA-Video video-token shape is comfortably above this.
+# mode. Only video-token tensors meeting this threshold are eligible.
 _MIN_ELEMENTS = 2_000_000
 
 _Signature = tuple[torch.device, torch.dtype, int, int]
 _VERIFIED_SIGNATURES: set[_Signature] = set()
 _DISABLED_SIGNATURES: set[_Signature] = set()
+# The mean and sum/count reductions have different numerical contracts and
+# must never share first-sight verification or failure state.
+_VERIFIED_SUM_SIGNATURES: set[_Signature] = set()
+_DISABLED_SUM_SIGNATURES: set[_Signature] = set()
 
 
 if HAS_TRITON:
@@ -117,6 +125,21 @@ def _eager_sana_rms_norm(
     if weight.dtype in (torch.float16, torch.bfloat16):
         hidden_states = hidden_states.to(weight.dtype)
     return hidden_states * weight
+
+
+def _eager_sana_rms_norm_sum(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    # Match SanaDistributedRMSNorm at TP=1, including x.float() for the
+    # normalization multiply and a separate FP32 division after aten::sum.
+    x_float = hidden_states.float()
+    sum_sq = x_float.pow(2).sum(dim=-1, keepdim=True)
+    normalized = x_float * torch.rsqrt(sum_sq / hidden_states.shape[-1] + eps)
+    if weight.dtype in (torch.float16, torch.bfloat16):
+        normalized = normalized.to(weight.dtype)
+    return normalized * weight
 
 
 def _kernel_inputs_supported(hidden_states: torch.Tensor, weight: torch.Tensor) -> bool:
@@ -201,6 +224,28 @@ def _exact_sana_rms_norm_impl(
     return _launch_exact_sana_rms_norm(hidden_states, weight, eps)
 
 
+def _launch_exact_sana_rms_norm_sum(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    squares = _square_bf16_to_fp32(hidden_states)
+    sum_sq = squares.sum(dim=-1, keepdim=True)
+    del squares
+    inverse_rms = torch.rsqrt(sum_sq / hidden_states.shape[-1] + eps)
+    return _rms_norm_affine_tail(hidden_states, inverse_rms, weight)
+
+
+def _exact_sana_rms_norm_sum_impl(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    if not _kernel_inputs_supported(hidden_states, weight):
+        return _eager_sana_rms_norm_sum(hidden_states, weight, eps)
+    return _launch_exact_sana_rms_norm_sum(hidden_states, weight, eps)
+
+
 def _exact_sana_rms_norm_fake(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
@@ -220,6 +265,15 @@ if not hasattr(torch.ops.vllm_omni, "exact_sana_rms_norm"):
         target_lib=_OMNI_OP_LIB,
     )
 
+if not hasattr(torch.ops.vllm_omni, "exact_sana_rms_norm_sum"):
+    direct_register_custom_op(
+        op_name="exact_sana_rms_norm_sum",
+        op_func=_exact_sana_rms_norm_sum_impl,
+        fake_impl=_exact_sana_rms_norm_fake,
+        mutates_args=[],
+        target_lib=_OMNI_OP_LIB,
+    )
+
 
 def _signature(hidden_states: torch.Tensor) -> _Signature:
     hidden_size = hidden_states.shape[-1]
@@ -232,57 +286,89 @@ def _storage_equal(left: torch.Tensor, right: torch.Tensor) -> bool:
     return torch.equal(left.view(torch.int16), right.view(torch.int16))
 
 
+def _verified_sana_rms_norm(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    sum_reduction: bool = False,
+) -> torch.Tensor:
+    eager = _eager_sana_rms_norm_sum if sum_reduction else _eager_sana_rms_norm
+    # Preserve the model's pre-existing full-compile behavior.  The custom-op
+    # fast path is intentionally an eager/CUDA-graph optimization; regional
+    # compilation of other SANA submodules does not enter this branch.
+    if torch.compiler.is_compiling():
+        return eager(hidden_states, weight, eps)
+
+    if not _can_use_exact_sana_rms_norm(hidden_states, weight):
+        return eager(hidden_states, weight, eps)
+
+    verified = _VERIFIED_SUM_SIGNATURES if sum_reduction else _VERIFIED_SIGNATURES
+    disabled = _DISABLED_SUM_SIGNATURES if sum_reduction else _DISABLED_SIGNATURES
+    reduction = "sum/count" if sum_reduction else "mean"
+    signature = _signature(hidden_states)
+    if signature in disabled:
+        return eager(hidden_states, weight, eps)
+
+    if signature not in verified:
+        if torch.cuda.is_current_stream_capturing():
+            # Synchronizing a first-sight bit comparison is illegal during
+            # graph capture.  A prior eager warmup can verify the signature.
+            return eager(hidden_states, weight, eps)
+
+    try:
+        if sum_reduction:
+            output = torch.ops.vllm_omni.exact_sana_rms_norm_sum(hidden_states, weight, eps)
+        else:
+            output = torch.ops.vllm_omni.exact_sana_rms_norm(hidden_states, weight, eps)
+    except torch.OutOfMemoryError:
+        # Temporary memory pressure does not invalidate this kernel signature.
+        raise
+    except Exception as error:
+        disabled.add(signature)
+        logger.warning_once(
+            "SANA exact RMSNorm (%s) failed for %s; disabling this signature: %s",
+            reduction,
+            signature,
+            error,
+        )
+        return eager(hidden_states, weight, eps)
+
+    if signature not in verified:
+        reference = eager(hidden_states, weight, eps)
+        if not _storage_equal(output, reference):
+            disabled.add(signature)
+            logger.warning_once(
+                "SANA exact RMSNorm (%s) did not match eager output for %s; disabling this signature",
+                reduction,
+                signature,
+            )
+            return reference
+        verified.add(signature)
+
+    return output
+
+
 def exact_sana_rms_norm(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    """Apply SANA's no-bias affine RMSNorm, using a verified CUDA fast path."""
-    # Preserve the model's pre-existing full-compile behavior.  The custom-op
-    # fast path is intentionally an eager/CUDA-graph optimization; regional
-    # compilation of other SANA submodules does not enter this branch.
-    if torch.compiler.is_compiling():
-        return _eager_sana_rms_norm(hidden_states, weight, eps)
-
-    if not _can_use_exact_sana_rms_norm(hidden_states, weight):
-        return _eager_sana_rms_norm(hidden_states, weight, eps)
-
-    signature = _signature(hidden_states)
-    if signature in _DISABLED_SIGNATURES:
-        return _eager_sana_rms_norm(hidden_states, weight, eps)
-
-    if signature not in _VERIFIED_SIGNATURES:
-        if torch.cuda.is_current_stream_capturing():
-            # Synchronizing a first-sight bit comparison is illegal during
-            # graph capture.  A prior eager warmup can verify the signature.
-            return _eager_sana_rms_norm(hidden_states, weight, eps)
-
-    try:
-        output = torch.ops.vllm_omni.exact_sana_rms_norm(hidden_states, weight, eps)
-    except torch.OutOfMemoryError:
-        # Temporary memory pressure does not invalidate this kernel signature.
-        raise
-    except Exception as error:
-        _DISABLED_SIGNATURES.add(signature)
-        logger.warning_once(
-            "SANA exact RMSNorm failed for %s; disabling this signature: %s",
-            signature,
-            error,
-        )
-        return _eager_sana_rms_norm(hidden_states, weight, eps)
-
-    if signature not in _VERIFIED_SIGNATURES:
-        reference = _eager_sana_rms_norm(hidden_states, weight, eps)
-        if not _storage_equal(output, reference):
-            _DISABLED_SIGNATURES.add(signature)
-            logger.warning_once(
-                "SANA exact RMSNorm did not match eager output for %s; disabling this signature",
-                signature,
-            )
-            return reference
-        _VERIFIED_SIGNATURES.add(signature)
-
-    return output
+    """Apply SANA's mean-based no-bias affine RMSNorm with verified fusion."""
+    return _verified_sana_rms_norm(hidden_states, weight, eps)
 
 
-__all__ = ["exact_sana_rms_norm"]
+def exact_sana_rms_norm_sum(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Apply SanaDistributedRMSNorm's sum/count contract at TP=1 only.
+
+    The caller must guard TP=1. This helper deliberately has no collective;
+    TP>1 must retain the original global sum and global element count.
+    """
+    return _verified_sana_rms_norm(hidden_states, weight, eps, sum_reduction=True)
+
+
+__all__ = ["exact_sana_rms_norm", "exact_sana_rms_norm_sum"]

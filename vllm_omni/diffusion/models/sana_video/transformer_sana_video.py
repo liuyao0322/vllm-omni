@@ -41,7 +41,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_sequence_parallel_world_size,
     get_sp_group,
 )
-from vllm_omni.diffusion.layers.sana_rms_norm import exact_sana_rms_norm
+from vllm_omni.diffusion.layers.sana_rms_norm import exact_sana_rms_norm, exact_sana_rms_norm_sum
 
 
 def validate_sana_video_parallel_config(parallel_config) -> None:
@@ -220,6 +220,11 @@ class SanaDistributedRMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         tp_size = get_tensor_model_parallel_world_size()
+        if tp_size == 1:
+            # Video Q/K norms use sum/count, not SanaRMSNorm's mean. Fuse
+            # only the pointwise regions; TP>1 keeps its global reduction.
+            return exact_sana_rms_norm_sum(x, self.weight, self.eps)
+
         x_float = x.float()
         sum_sq = x_float.pow(2).sum(dim=-1, keepdim=True)
         count = x.shape[-1]
