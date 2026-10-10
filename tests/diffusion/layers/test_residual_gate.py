@@ -228,12 +228,13 @@ def test_residual_gate_add_dispatches_supported_inputs(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
-def test_residual_gate_add_caches_runtime_failure(monkeypatch):
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_residual_gate_add_caches_runtime_failure(monkeypatch, dtype):
     import vllm_omni.diffusion.layers.residual_gate as residual_gate
 
-    residual = torch.randn(2, 19, 32, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn(2, 19, 32, device="cuda", dtype=dtype)
     update = torch.randn_like(residual)
-    gate = torch.randn(2, 1, 32, device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn(2, 1, 32, device="cuda", dtype=dtype)
     launch_calls = 0
 
     def failing_launch(residual, update, gate):
@@ -251,6 +252,75 @@ def test_residual_gate_add_caches_runtime_failure(monkeypatch):
     assert (residual.device.index, residual.dtype) in residual_gate._FAILED_RUNTIME_KEYS
     assert torch.equal(first, expected)
     assert torch.equal(second, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["contiguous", "transposed"])
+@pytest.mark.parametrize("failure_site", ["output_allocation", "kernel_launch"])
+def test_residual_gate_add_retries_after_out_of_memory(
+    monkeypatch,
+    dtype,
+    layout,
+    failure_site,
+):
+    import vllm_omni.diffusion.layers.residual_gate as residual_gate
+
+    shape = (2, 37, 68)
+    torch.manual_seed(17)
+    residual = _make_residual(shape, layout, dtype)
+    update = _make_update(shape, dtype)
+    gate = _make_gate(shape, "tokenwise", dtype)
+    expected = residual + gate * update
+    oom = torch.OutOfMemoryError(f"synthetic OOM during {failure_site}")
+    fault_count = 0
+    successful_kernel_launches = 0
+
+    original_empty_strided = torch.empty_strided
+
+    def injected_empty_strided(*args, **kwargs):
+        nonlocal fault_count
+        if failure_site == "output_allocation" and fault_count == 0:
+            fault_count += 1
+            raise oom
+        return original_empty_strided(*args, **kwargs)
+
+    kernel = (
+        residual_gate._residual_gate_add_contiguous_kernel
+        if layout == "contiguous"
+        else residual_gate._residual_gate_add_transposed_kernel
+    )
+    original_kernel_run = kernel.run
+
+    def injected_kernel_run(*args, **kwargs):
+        nonlocal fault_count, successful_kernel_launches
+        if failure_site == "kernel_launch" and fault_count == 0:
+            fault_count += 1
+            raise oom
+        result = original_kernel_run(*args, **kwargs)
+        successful_kernel_launches += 1
+        return result
+
+    monkeypatch.setattr(torch, "empty_strided", injected_empty_strided)
+    monkeypatch.setattr(kernel, "run", injected_kernel_run)
+
+    with pytest.raises(torch.OutOfMemoryError) as exc_info:
+        residual_gate.residual_gate_add(residual, update, gate)
+
+    assert exc_info.value is oom
+    assert fault_count == 1
+    assert not residual_gate._FAILED_RUNTIME_KEYS
+
+    recovered = residual_gate.residual_gate_add(residual, update, gate)
+
+    assert successful_kernel_launches == 1
+    assert not residual_gate._FAILED_RUNTIME_KEYS
+    assert recovered.stride() == residual.stride()
+    assert torch.equal(
+        recovered.contiguous().view(torch.int16),
+        expected.contiguous().view(torch.int16),
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

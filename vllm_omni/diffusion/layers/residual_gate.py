@@ -293,6 +293,9 @@ def residual_gate_add(
     if runtime_key not in _FAILED_RUNTIME_KEYS and _can_use_fused_residual_gate_add(residual, update, gate):
         try:
             return _launch_fused_residual_gate_add(residual, update, gate)
+        except torch.OutOfMemoryError:
+            # Transient memory pressure must not permanently disable fusion.
+            raise
         except Exception as exc:
             _FAILED_RUNTIME_KEYS.add(runtime_key)
             logger.warning_once(
