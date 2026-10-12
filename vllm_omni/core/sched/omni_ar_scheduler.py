@@ -25,7 +25,6 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.utils import (
     free_kv_blocks_in_physical_order,
-    omni_routed_experts_for_request,
 )
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
@@ -45,6 +44,19 @@ def _should_emit_engine_output(
         bool(getattr(model_config, "use_v2_model_runner", False))
         and bool(getattr(model_config, "async_chunk", False))
         and not bool(getattr(model_config, "final_output", False))
+    )
+
+
+def _holds_payloadless_outputs(model_config: object) -> bool:
+    """Whether a final audio stage may fold token-only steps into its next output.
+
+    Such a stage streams audio through ``multimodal_output``; its codec tokens
+    are not client-visible. Steps that sampled a token but produced no audio
+    then only cost serialization, IPC and per-output API work.
+    """
+    # OmniModelConfig fields; a plain vLLM ModelConfig has neither.
+    return bool(getattr(model_config, "final_output", False)) and (
+        getattr(model_config, "engine_output_type", None) == "audio"
     )
 
 
@@ -99,7 +111,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     core scheduling logic.
     """
 
-    max_num_running_reqs: int
+    max_num_active_reqs: int
 
     def reset_prefix_cache(self, reset_running_requests: bool = False, reset_connector: bool = False) -> bool:
         model_config = self.vllm_config.model_config
@@ -161,6 +173,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Drained into an explicit FinishReason.ERROR output on the next
         # update_from_output so the client learns why the session ended.
         self._streaming_context_overflow: dict[str, tuple[int, str]] = {}
+        self._hold_payloadless_outputs = _holds_payloadless_outputs(self.vllm_config.model_config)
+        # External finishes release Request before their terminal output is assembled.
+        self._held_token_ids: dict[str, list[int]] = {}
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -380,32 +395,32 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # them. Upstream vllm raises RuntimeError on this status; omni allows
         # async abort (e.g. client disconnect during TTS streaming) to leave
         # requests in the waiting/running queues temporarily.
-        waiting = getattr(self, "waiting")
         self._drop_aborted_queued_requests()
         self._process_pending_omni_inputs(model_mode="ar")
         self._drop_aborted_queued_requests()
         self._resync_streaming_input_counter()
-        original_waiting = None
+        original_wait_queues = None
         if self._should_defer_waiting_admission():
-            original_waiting = waiting
+            original_wait_queues = self.waiting, self.kv_holding_waiting
             self.waiting = create_request_queue(self.policy)
+            self.kv_holding_waiting = create_request_queue(self.policy)
 
-        original_max_num_running_reqs = self.max_num_running_reqs
+        original_max_num_active_reqs = self.max_num_active_reqs
         async_chunk_transport = self._async_chunk_transport_enabled()
         reserved_running_slots = (
             self._get_async_chunk_reserved_running_slots() if async_chunk_transport and self.use_v2_model_runner else 0
         )
         if reserved_running_slots:
-            self.max_num_running_reqs = max(0, original_max_num_running_reqs - reserved_running_slots)
+            self.max_num_active_reqs = max(0, original_max_num_active_reqs - reserved_running_slots)
         try:
             scheduler_output = super().schedule(throttle_prefills)
         finally:
-            self.max_num_running_reqs = original_max_num_running_reqs
-            if original_waiting is not None:
-                deferred_waiting = list(self.waiting)
-                if deferred_waiting:
-                    original_waiting.prepend_requests(deferred_waiting)
-                self.waiting = original_waiting
+            self.max_num_active_reqs = original_max_num_active_reqs
+            if original_wait_queues is not None:
+                original_waiting, original_kv_holding = original_wait_queues
+                original_waiting.prepend_requests(self.waiting)
+                original_kv_holding.prepend_requests(self.kv_holding_waiting)
+                self.waiting, self.kv_holding_waiting = original_wait_queues
             self._restore_omni_wait_queues()
 
         self._postprocess_omni_schedule_output(
@@ -428,10 +443,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
+        prompt_token_id_logprobs_dict = getattr(model_runner_output, "prompt_token_id_logprobs_dict", {})
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         mm_outputs = getattr(model_runner_output, "multimodal_outputs", None)
         inter_stage_outputs = getattr(model_runner_output, "inter_stage_outputs", None)
+        # Token-only processors need sampled IDs even without a tensor payload.
+        processor = getattr(getattr(self, "chunk_transfer_adapter", None), "custom_process_next_stage_input_func", None)
+        requires_token_updates = getattr(processor, "requires_token_updates", False) is True
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         ec_connector_output = getattr(model_runner_output, "ec_connector_output", None)
@@ -689,7 +708,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # Only when this step might save. Read additional_information
             # before _free_request rewrites it.
             omits_chunk_transfer = False
-            if self.chunk_transfer_adapter is not None and (inter_stage_output is not None or stopped):
+            if self.chunk_transfer_adapter is not None and (
+                inter_stage_output is not None or (new_token_ids and requires_token_updates) or stopped
+            ):
                 omits_chunk_transfer = self._request_omits_chunk_transfer_to_next_stage(request)
             # Capture before resumable stop handling can clear token history.
             output_token_ids: Any = getattr(request, "output_token_ids", None)
@@ -699,8 +720,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if stopped:
                 if self.chunk_transfer_adapter is not None:
                     confirmed_num_computed_tokens = self.chunk_transfer_adapter._confirmed_num_computed_tokens(request)
-                if model_runner_output.routed_experts is not None:
-                    routed_experts = omni_routed_experts_for_request(model_runner_output.routed_experts, request)
+                if (
+                    self.aux_output_connector is not None
+                    and (aux_output := model_runner_output.aux_output_connector_output) is not None
+                ):
+                    routed_experts = self.aux_output_connector.take_output(request, aux_output)
 
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
@@ -773,6 +797,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
+            prompt_token_id_logprobs = prompt_token_id_logprobs_dict.get(req_id)
             has_stage_output = (
                 bool(new_token_ids)
                 or mm_output is not None
@@ -780,6 +805,26 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 or kv_transfer_params
                 or stopped
             )
+            if (
+                has_stage_output
+                and not stopped
+                and not mm_output
+                and pooler_output is None
+                and prefill_stats is None
+                and new_logprobs is None
+                and prompt_logprobs_tensors is None
+                and prompt_token_id_logprobs is None
+                and kv_transfer_params is None
+                and request.num_nans_in_logits == 0
+                and self._hold_payloadless_outputs
+                and request.sampling_params is not None
+                and not request.sampling_params.detokenize
+            ):
+                # Token-only step of a final audio stage: the client sees
+                # nothing new, so carry the tokens on the next emitted output
+                # instead of sending one output per decode step.
+                self._held_token_ids.setdefault(req_id, []).extend(new_token_ids)
+                has_stage_output = False
             if has_stage_output and _should_emit_engine_output(
                 self.vllm_config.model_config,
                 stopped=stopped,
@@ -793,6 +838,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     finish_reason=finish_reason,
                     new_logprobs=new_logprobs,
                     new_prompt_logprobs_tensors=prompt_logprobs_tensors,
+                    prompt_token_id_logprobs=prompt_token_id_logprobs,
                     pooling_output=pooling_output_payload,
                     multimodal_output=mm_output,
                     stop_reason=request.stop_reason,
@@ -808,6 +854,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
+                assert prompt_token_id_logprobs is None
 
             if omits_chunk_transfer and inter_stage_output is not None:
                 logger.warning(
@@ -818,7 +865,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if (
                 self.chunk_transfer_adapter is not None
                 and not omits_chunk_transfer
-                and (inter_stage_output is not None or is_segment_finished or finished)
+                and (
+                    inter_stage_output is not None
+                    or (new_token_ids and requires_token_updates)
+                    or is_segment_finished
+                    or finished
+                )
             ):
                 save_kwargs = {
                     "new_token_ids": new_token_ids,
@@ -871,6 +923,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             engine_core_outputs,
             synthesize_abort_outputs=True,
         )
+
+        # Include external errors, control messages and synthetic aborts in the
+        # same flush, after every output path has finished assembling its batch.
+        if self._hold_payloadless_outputs:
+            for client_output in engine_core_outputs.values():
+                for output in client_output.outputs:
+                    held = self._held_token_ids.pop(output.request_id, None)
+                    if held:
+                        output.new_token_ids = held + output.new_token_ids
+                        output.is_coalesced = True
 
         self._attach_scheduler_stats(
             engine_core_outputs,
@@ -966,8 +1028,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
                     self.num_waiting_for_streaming_input -= 1
                 session.status = RequestStatus.WAITING
-                if session in self.skipped_waiting:
-                    self.skipped_waiting.remove_requests((session,))
+                self.deferred_waiting.discard(session)
+                if session in self.kv_holding_waiting:
+                    self.kv_holding_waiting.remove_requests((session,))
                     self._enqueue_waiting_request(session)
 
                 if self.log_stats:
@@ -1020,22 +1083,28 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             "update_streaming_prompt_for_condition",
             None,
         )
-        if stage_id != 0 and streaming_prompt_payload is not None and callable(update_streaming_prompt):
+        native_prompt = bool(getattr(self, "_native_data_plane", False))
+        if (
+            stage_id != 0
+            and streaming_prompt_payload is not None
+            and (callable(update_streaming_prompt) or native_prompt)
+        ):
             mm_feature_base = session.num_computed_tokens
             try:
-                replaced = update_streaming_prompt(
-                    streaming_prompt_payload,
-                    session,
-                    update_prompt=True,
-                )
+                if callable(update_streaming_prompt):
+                    replaced = update_streaming_prompt(streaming_prompt_payload, session, update_prompt=True)
+                else:
+                    replaced = self._update_native_streaming_prompt(session, streaming_prompt_payload)
             except ValueError as exc:
                 # This streaming update has already been dequeued. Report the
                 # permanent contract failure so the next scheduling pass
                 # finishes only this request instead of crashing EngineCore.
-                # callable(update_streaming_prompt) above implies a live
-                # adapter; the assert narrows it for the type checker.
-                assert chunk_transfer_adapter is not None
-                chunk_transfer_adapter.record_receive_failure(req_id, str(exc))
+                if chunk_transfer_adapter is not None:
+                    chunk_transfer_adapter.record_receive_failure(req_id, str(exc))
+                else:
+                    self._streaming_context_overflow[req_id] = (session.client_index, str(exc))
+                    if not session.is_finished():
+                        self.finish_requests((req_id,), RequestStatus.FINISHED_ERROR)
                 return
             if replaced is not None:
                 if replaced:
@@ -1074,6 +1143,18 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         super()._update_request_as_session(session, update)
         if hasattr(update, "model_intermediate_buffer"):
             session.model_intermediate_buffer = update.model_intermediate_buffer
+
+    def _update_native_streaming_prompt(self, session: Request, payload: dict[str, Any]) -> bool | None:
+        """Delegate streaming prompt policy to the stage's payload processor."""
+        from vllm.utils.import_utils import resolve_obj_by_qualname
+
+        if not hasattr(self, "_native_prompt_hook"):
+            path = getattr(self.vllm_config.model_config, "custom_process_next_stage_input_func", None)
+            processor = resolve_obj_by_qualname(path) if path else None
+            self._native_prompt_hook = getattr(processor, "update_streaming_prompt_for_condition", None)
+        if self._native_prompt_hook is None:
+            return None
+        return self._native_prompt_hook(self.vllm_config.model_config, session, payload)
 
     def _maybe_reanchor_streaming_window(
         self,
@@ -1391,7 +1472,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         ``_free_blocks``) and skips the caller's input-coordinator cleanup.
         """
         self.waiting.remove_requests((request,))
-        self.skipped_waiting.remove_requests((request,))
+        self.kv_holding_waiting.remove_requests((request,))
+        self.deferred_waiting.discard(request)
         if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             self.num_waiting_for_streaming_input -= 1
         request.status = RequestStatus.FINISHED_ERROR
@@ -1482,6 +1564,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._new_prompt_len_snapshot.pop(request_id, None)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
+        elif status == RequestStatus.FINISHED_ABORTED:
+            # Without finished-request notifications no synthetic abort output
+            # will flush these tokens; the cancelled consumer no longer needs them.
+            getattr(self, "_held_token_ids", {}).pop(request_id, None)
 
         # Mirror the generation scheduler's try/finally pattern so the
         # input_coordinator entry is always pruned along every return path,

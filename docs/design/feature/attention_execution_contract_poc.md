@@ -131,3 +131,54 @@ and real-kernel schema/fake checks pass. The full suite must be rerun with the
 vLLM version required by upstream. NPU/ROCm device numerics and compilation remain
 unvalidated. Pre-commit passes with the CI hook skips. Upstream PyTorch/CUTLASS
 warnings remain.
+
+## SageAttention dense execution
+
+`SAGE_ATTN` declares `SUPPORTED` / `CUSTOM_OP` for dense FP16/BF16 on
+H100/H200/GH200 (SM90), head sizes 32/64/96/128 with contiguous head elements, and equal Q/K/V head
+counts. Causal attention additionally requires equal Q/K lengths. Resolution
+uses the input device and initialized causal setting. Other architectures, XPU,
+packed, paged-KV, piecewise, quantized-KV, parallel, and HSDP paths remain
+`UNMIGRATED`; the pre-construction result is also conservative.
+
+`test_sage_attn_compile.py` validates real eager/fullgraph replay, padded-head
+output strides, input preservation, schema/fake agreement, and the production
+`Attention` entry point.
+
+### SageAttention3
+
+SageAttention3 uses a separate backend and custom op from SageAttention2.
+Its verified `SUPPORTED` / `CUSTOM_OP` scope is dense FP16/BF16 on SM120,
+head sizes 64/128 with contiguous head elements, equal Q/K/V head counts,
+default softmax scale, and no dropout. Causal attention requires equal Q/K lengths.
+Packed, paged-KV, piecewise, parallel, HSDP, and other unverified configurations
+remain `UNMIGRATED`, including SM121. This does not prevent ordinary execution
+or compilation. Head size 256 is not claimed
+as an FP4 path: the inspected Sage3 dispatcher falls back to SDPA there.
+The custom op copies K before vendor preprocessing (which centers K in place)
+and normalizes output strides to match its fake implementation.
+`test_sage_attn3_compile.py` targets upstream runtime architectures SM120/SM121
+with a matching Sage3 binary, checking input preservation,
+full-graph replay against eager Sage3, and schema/fake agreement for head sizes
+64 and 128.
+
+## TRTLLM dense execution
+
+`TRTLLM_ATTN` declares `SUPPORTED` / `CUSTOM_OP` for noncausal dense BF16 on
+B200/GB200 (SM100) and B300/GB300 (SM103), head dimension 128, and equal Q/K/V
+head counts, without parallel, paged-KV, piecewise, or HSDP boundaries. Pre-construction, SAGE, skip-softmax, packed,
+and other unverified paths remain `UNMIGRATED`. Resolution and dispatch share
+metadata validation; workspace mutation is explicit in the custom-op schema.
+
+CPU contract tests cover fullgraph replay and schema/fake consistency using a
+substituted dispatcher. Real-kernel validation requires Blackwell with FlashInfer:
+
+```bash
+python -m pytest tests/diffusion/attention/test_trtllm_attn.py \
+  -k dense_contract_fullgraph_matches_sdpa -q -rs
+```
+
+These hardware tests compare eager/compiled output with FP32 SDPA and check
+schema/fake agreement. The TRTLLM and contract suite passed on Blackwell before the final architecture
+restriction was added: 61 passed, no skips (19 dependency deprecation warnings).
+The SM100/SM103 restriction is additionally covered by CPU contract tests.
