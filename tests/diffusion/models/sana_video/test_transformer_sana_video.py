@@ -66,17 +66,21 @@ _GOLDEN_PREFIX = torch.tensor(
 )
 
 
-def test_residual_gate_add_cpu_fallback_matches_eager():
-    from vllm_omni.diffusion.layers.residual_gate import residual_gate_add
+def test_residual_gate_add_cpu_fallback_matches_eager(mocker):
+    import vllm_omni.diffusion.layers.residual_gate as residual_gate
+
+    launch = mocker.spy(residual_gate, "_launch_fused_residual_gate_add")
 
     torch.manual_seed(5)
     residual = torch.randn(2, 7, 24, dtype=torch.bfloat16)
     update = torch.randn_like(residual)
     gate = torch.randn(2, 1, 24, dtype=torch.bfloat16)
 
+    assert not residual_gate._can_use_fused_residual_gate_add(residual, update, gate)
     expected = residual + gate * update
-    actual = residual_gate_add(residual, update, gate)
+    actual = residual_gate.residual_gate_add(residual, update, gate)
 
+    launch.assert_not_called()
     assert torch.equal(actual, expected)
 
 
