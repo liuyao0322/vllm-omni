@@ -18,7 +18,6 @@ def get_sana_video2_video_generation_defaults(
         width=1280,
         height=736,
         num_frames=193,
-        fixed_num_frames=False,
         num_inference_steps=50,
         fps=24,
         guidance_scale=8.0,
