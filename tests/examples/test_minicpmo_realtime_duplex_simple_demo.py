@@ -60,7 +60,7 @@ def test_post_commit_decision_accepts_drained_speak_after_commit_ack():
     events = [
         {"type": "input_audio_buffer.committed"},
         {"type": "response.created", "response": {"id": "resp-a"}},
-        {"type": "response.audio.delta", "response_id": "resp-a", "delta": "AAAA"},
+        {"type": "response.output_audio.delta", "response_id": "resp-a", "delta": "AAAA"},
         {"type": "response.done", "response_id": "resp-a"},
     ]
 
@@ -126,7 +126,7 @@ def test_ref_audio_data_url_encodes_explicit_wav(tmp_path):
     assert demo._ref_audio_data_url(None) is None
 
 
-def test_realtime_duplex_demo_requires_ref_audio(monkeypatch):
+def test_realtime_duplex_demo_allows_the_server_default_ref_audio(monkeypatch):
     demo = _load_demo_module()
     monkeypatch.setattr(
         demo.sys,
@@ -138,8 +138,9 @@ def test_realtime_duplex_demo_requires_ref_audio(monkeypatch):
         ],
     )
 
-    with pytest.raises(SystemExit):
-        demo.parse_args()
+    args = demo.parse_args()
+
+    assert args.ref_audio is None
 
 
 def test_realtime_duplex_demo_accepts_explicit_ref_audio(monkeypatch):
@@ -267,7 +268,7 @@ def test_streaming_output_writer_persists_audio_deltas_as_they_arrive(tmp_path, 
 
     writer.handle(
         {
-            "type": "response.audio.delta",
+            "type": "response.output_audio.delta",
             "response_id": "resp-a",
             "delta": base64.b64encode(first_pcm).decode("ascii"),
             "sample_rate_hz": 24_000,
@@ -275,14 +276,14 @@ def test_streaming_output_writer_persists_audio_deltas_as_they_arrive(tmp_path, 
     )
     writer.handle(
         {
-            "type": "response.audio_transcript.delta",
+            "type": "response.output_audio_transcript.delta",
             "response_id": "resp-a",
             "delta": "你好",
         }
     )
     writer.handle(
         {
-            "type": "response.audio.delta",
+            "type": "response.output_audio.delta",
             "response_id": "resp-a",
             "delta": base64.b64encode(second_pcm).decode("ascii"),
             "sample_rate_hz": 24_000,
