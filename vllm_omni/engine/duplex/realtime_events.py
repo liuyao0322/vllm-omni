@@ -31,7 +31,6 @@ from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 from vllm_omni.engine.duplex.commands import (
-    AppendAudio,
     CancelResponse,
     ClearOutputAudio,
     Commit,
@@ -476,7 +475,7 @@ def _response_created_event(event: Mapping[str, object]) -> ResponseCreated:
 
 
 def _response_speak_metadata(event: Mapping[str, object]) -> dict[str, object]:
-    return {key: event[key] for key in ("session_id", "epoch", "model_speak") if key in event}
+    return {key: event[key] for key in ("session_id", "epoch", "model_speak", "vllm_omni") if key in event}
 
 
 def _realtime_audio_delta_events(
@@ -804,7 +803,9 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
             "status": "in_progress",
             "content": [],
         }
-        state.conversation_items[item_id] = item
+        # Later deltas grow the state item. Keep creation events independent
+        # so their queued payloads retain the size measured at admission.
+        state.conversation_items[item_id] = {**item, "content": []}
         events = [
             _response_created_event(event),
             *_conversation_item_added_events(state, item),
@@ -839,17 +840,19 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
             _refresh_in_progress_response_item(state, response_id)
         text = event.get("text")
         has_text = isinstance(text, str) and bool(text)
+        has_audio_delta = isinstance(audio, str) and bool(audio)
         if has_text:
             _append_response_transcript(state, response_id, cast("str", text))
             _refresh_in_progress_response_item(state, response_id)
         # Keep the audio.delta + transcript.delta pair invariant even for
         # text-less units so clients that treat the pair as unit-complete work.
-        if has_text or (isinstance(audio, str) and bool(audio)):
+        if has_text or has_audio_delta:
             events.append(
                 TranscriptDelta(
                     response_id=_str_or_none(response_id),
                     item_id=_response_item_id(state, response_id),
                     delta=cast("str", text) if has_text else "",
+                    metadata=_response_speak_metadata(event) if has_text and not has_audio_delta else None,
                 )
             )
         if event.get("end_of_turn") is True:
@@ -1574,16 +1577,10 @@ def resolve_create_item(state: RealtimeProjectionState, command: CreateItem) -> 
     return ResolvedControl(payloads=[signal_payload], events=ack_events)
 
 
-def append_audio_payload(command: AppendAudio) -> dict[str, object]:
-    """Internal ``input_audio_buffer.append`` payload for a command (convenience for the runner)."""
-    return command.payload()
-
-
 __all__ = [
     "RealtimeProjectionState",
     "ResolvedCommit",
     "ResolvedControl",
-    "append_audio_payload",
     "clear_input_buffer",
     "discard_pending_input_audio",
     "emit_input_speech_started",

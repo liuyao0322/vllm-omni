@@ -29,7 +29,6 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol
 
-import pybase64 as base64
 from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.config import DuplexSessionState
@@ -46,6 +45,7 @@ from vllm_omni.engine.duplex.contracts import (
 from vllm_omni.engine.duplex.plugin import (
     DuplexRuntimeConfigError,
     coerce_int,
+    payload_turn_id,
 )
 from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext, StageOutput
@@ -82,7 +82,6 @@ class ModelChannel:
     """Appends out to the model, events back from it, for one session."""
 
     # One MiniCPM model unit (1 s at 16 kHz) is the compatibility default.
-    _SILENCE_UNIT_PAYLOAD_AUDIO = base64.b64encode(bytes(16000 * 4)).decode("ascii")
     _RESPONSE_MAX_CONTINUATION_UNITS = 8
     _AUTO_RESPONSE_MAX_CONTINUATION_UNITS = 64
 
@@ -192,6 +191,7 @@ class ModelChannel:
             return True, False
         if expected_epoch is not None and session.epoch != expected_epoch:
             return True, False
+        self._mark_accepted_append_request_start(payload)
         # Commit timing state before returned output events can clear the
         # silence-continuation chain (e.g. a terminal turn-end).
         if on_append_accepted is not None:
@@ -207,6 +207,16 @@ class ModelChannel:
             await self._close_from_runtime(close_reason)
             return False, emitted_response
         return True, emitted_response
+
+    def _mark_accepted_append_request_start(self, payload: object) -> None:
+        """Stamp TTFT/TTFP origin only after the data plane accepted this append."""
+        session = self._ctx.session
+        turn_id = payload_turn_id(payload)
+        if turn_id is None:
+            turn_id = (
+                session.active_response_turn_id if session.active_response_turn_id is not None else session.turn_id
+            )
+        session.mark_model_turn_request_started(turn_id, session._clock())
 
     async def _append_via_data_plane(
         self,
@@ -292,7 +302,11 @@ class ModelChannel:
                 request_id=request_id,
                 fence=fence,
                 session_config=self._ctx.plugin.prepare_prompt_config(
-                    {**request_context.session_config, "conversation": list(session.history)},
+                    {
+                        **request_context.session_config,
+                        "conversation": list(session.history),
+                        "modalities": list(session.response_config.modalities),
+                    },
                     state=self._ctx.model_state,
                     payload=prompt_payload,
                 ),
@@ -323,6 +337,7 @@ class ModelChannel:
                     raise DuplexFenceMismatchError(session.fence, fence)
                 update = session.commit_append(reservation)
                 session.bind_stage_request(stage_id, request_id, fence=fence)
+                self._ctx.plugin.commit_append_plan(request_id)
             except BaseException:
                 try:
                     await self._ctx.stage_port.cleanup([request_id])
@@ -360,6 +375,10 @@ class ModelChannel:
                     }
                 ],
             }
+        except BaseException:
+            if not resumable:
+                self._ctx.plugin.data_plane.close_stream(request_id)
+            raise
         finally:
             if operation_started and lease_operation_id in session.lease.active_operations:
                 try:
@@ -471,8 +490,9 @@ class ModelChannel:
             context=context,
         )
 
-    @staticmethod
-    def stage_metrics_snapshot(stage_id: int, metrics: object, output: object) -> dict[str, dict[str, object]] | None:
+    def stage_metrics_snapshot(
+        self, stage_id: int, metrics: object, output: object
+    ) -> dict[str, dict[str, object]] | None:
         if not isinstance(metrics, StageRequestStats):
             return None
         event = metrics
@@ -482,6 +502,7 @@ class ModelChannel:
             final_output_type = getattr(output, "final_output_type", None)
             if isinstance(final_output_type, str):
                 event = replace(event, final_output_type=final_output_type)
+        self._ctx.session.observe_stage_request_stats(stage_id, event)
         try:
             merged = OrchestratorAggregator._merge_stage_metric_event(None, event)
         except Exception:
@@ -555,10 +576,18 @@ class ModelChannel:
                 ):
                     return
         engine_output = self._build_stage_output(item)
+        runtime_config = self._ctx.plugin.runtime_config_after_model_output(
+            dict(session.runtime_config),
+            item.context.segment_output_metadata,
+        )
+        if runtime_config is not None:
+            session.replace_runtime_config(runtime_config)
         drain_result = {"data_plane_outputs": [engine_output]}
         close_reason, emitted_response = await self._send_model_output_events(
             drain_result, expected_epoch=expected_epoch
         )
+        if self._ctx.run.closing:
+            return
         if close_reason is not None:
             await self._close_from_runtime(close_reason)
             return
@@ -589,7 +618,7 @@ class ModelChannel:
         expected_epoch: int | None = None,
     ) -> tuple[str | None, bool]:
         session = self._ctx.session
-        if expected_epoch is not None and session.epoch != expected_epoch:
+        if self._ctx.run.closing or (expected_epoch is not None and session.epoch != expected_epoch):
             return None, False
         close_reason: str | None = None
         emitted_response = False
@@ -606,7 +635,7 @@ class ModelChannel:
             )
             emitted_response = emitted_response or did_emit
             close_reason = close_reason or close_reason_for_result
-            if expected_epoch is not None and session.epoch != expected_epoch:
+            if self._ctx.run.closing or (expected_epoch is not None and session.epoch != expected_epoch):
                 return None, emitted_response
         return close_reason, emitted_response
 
@@ -618,7 +647,7 @@ class ModelChannel:
             str(model_result.get("error_code")),
             str(model_result.get("error") or "Duplex native data-plane error"),
         )
-        if response_id is None:
+        if self._ctx.run.closing or response_id is None:
             return
         session.end_response(commit_text=False)
         self._out.emit(
@@ -693,6 +722,8 @@ class ModelChannel:
                 if candidate not in release_ids and not session.is_draining_request(candidate):
                     release_ids.append(candidate)
         session.release_resources_for_request_ids(release_ids)
+        if self._ctx.run.stream_request_id in release_ids:
+            self._ctx.run.stream_request_id = None
         await self._ctx.stage_port.cleanup(release_ids)
 
     async def _on_model_listen(
@@ -716,6 +747,8 @@ class ModelChannel:
         close_reason: str | None = None
         emitted_response = False
         self._end_active_response_before_future_model_turn(model_turn_id=model_turn_id)
+        if self._ctx.run.closing:
+            return close_reason, emitted_response
         if (
             session.active_response_id is not None
             and model_turn_id is not None
@@ -758,10 +791,14 @@ class ModelChannel:
             payload["response_id"] = response_id
         self._attach_runtime_metadata(payload, model_result)
         self._out.emit(payload)
+        if self._ctx.run.closing:
+            return close_reason, emitted_response
         if model_result.get("abort_data_plane_request") is True and isinstance(data_plane_request_id, str):
             # stage_port.abort_requests expects a list of ids; a bare str is
             # iterated as characters and never matches the prewarmed binding.
             await self._abort_request([data_plane_request_id], notify=False)
+            if self._ctx.run.closing:
+                return close_reason, emitted_response
         if response_id is not None:
             if not auto_response and self.response_continuations_remaining(response_id):
                 self._ctx.services.spawn(
@@ -804,7 +841,7 @@ class ModelChannel:
         data_plane = self._ctx.plugin.data_plane
         close_reason: str | None = None
         emitted_response = False
-        if expected_epoch is not None and session.epoch != expected_epoch:
+        if self._ctx.run.closing or (expected_epoch is not None and session.epoch != expected_epoch):
             return close_reason, emitted_response
         data_plane_request_id = model_result.get("data_plane_request_id")
         if isinstance(data_plane_request_id, str) and data_plane.is_terminal(data_plane_request_id):
@@ -820,6 +857,15 @@ class ModelChannel:
             return close_reason, emitted_response
         if isinstance(model_result.get("error_code"), str):
             self._fail_response_from_model_error(model_result)
+            if model_result.get("end_of_turn") is True and not session.capabilities.supports_core_resumable_request:
+                # A failed ephemeral turn owns the same stage resources as a
+                # successful one. Release them before accepting another turn.
+                self._complete_model_turn_without_output(
+                    model_result,
+                    model_turn_id=coerce_int(model_result.get("model_turn_id")),
+                    data_plane_request_id=data_plane_request_id,
+                )
+                await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
             return close_reason, True
         if model_result.get("function_call") is True:
             self._out.emit(
@@ -914,6 +960,8 @@ class ModelChannel:
             return close_reason, emitted_response
         if draining_response_id is None:
             self._end_active_response_before_future_model_turn(model_turn_id=model_turn_id)
+        if self._ctx.run.closing:
+            return close_reason, emitted_response
         if (
             draining_response_id is None
             and session.active_response_id is not None
@@ -927,7 +975,18 @@ class ModelChannel:
         if response_id is None:
             response_id = session.begin_response(turn_id=model_turn_id)
             response_created = True
-            self._out.emit(self.response_created_payload(response_id, epoch=session.epoch))
+        response_request_metrics = session.mark_response_first_outputs(
+            observed_at_s=session._clock(),
+            has_text=has_text,
+            has_audio=has_audio,
+        )
+        if response_created:
+            created_payload = self.response_created_payload(response_id, epoch=session.epoch)
+            if response_request_metrics:
+                created_payload["response_request_metrics"] = response_request_metrics
+            self._out.emit(created_payload)
+            if self._ctx.run.closing:
+                return close_reason, emitted_response
         stage_metrics = model_result.get("stage_metrics")
         response_stage_metrics = session.accumulate_response_stage_metrics(
             stage_metrics if isinstance(stage_metrics, Mapping) else None
@@ -942,8 +1001,15 @@ class ModelChannel:
                 "end_of_turn": end_of_turn,
                 "model_speak": True,
             }
-            self._attach_runtime_metadata(speak_payload, model_result, stage_metrics=response_stage_metrics)
+            self._attach_runtime_metadata(
+                speak_payload,
+                model_result,
+                stage_metrics=response_stage_metrics,
+                response_request_metrics=response_request_metrics,
+            )
             self._out.emit(speak_payload)
+            if self._ctx.run.closing:
+                return close_reason, emitted_response
         target_id = draining_response_id if draining_response_id not in (None, session.active_response_id) else None
         previous_sent_ms = session.playback_for_response(target_id).sent_ms
         text_chars_before_append = len(session.assistant_transcript(target_id))
@@ -1013,8 +1079,15 @@ class ModelChannel:
         sample_rate_hz = model_result.get("sample_rate_hz") or model_result.get("audio_sample_rate_hz")
         if isinstance(sample_rate_hz, int | float) and int(sample_rate_hz) > 0:
             payload["sample_rate_hz"] = int(sample_rate_hz)
-        self._attach_runtime_metadata(payload, model_result, stage_metrics=response_stage_metrics)
+        self._attach_runtime_metadata(
+            payload,
+            model_result,
+            stage_metrics=response_stage_metrics,
+            response_request_metrics=response_request_metrics,
+        )
         self._out.emit(payload)
+        if self._ctx.run.closing:
+            return close_reason, emitted_response
         if (
             not end_of_turn
             and model_result.get("stage_role") == "tts"
@@ -1138,6 +1211,7 @@ class ModelChannel:
         model_result: dict[str, object],
         *,
         stage_metrics: Mapping[str, object] | None = None,
+        response_request_metrics: Mapping[str, object] | None = None,
     ) -> None:
         metadata: dict[str, object] = {}
         runtime_impl = model_result.get("runtime_impl")
@@ -1160,6 +1234,8 @@ class ModelChannel:
                 for stage_id, values in effective_stage_metrics.items()
                 if isinstance(values, Mapping)
             }
+        if response_request_metrics:
+            metadata["response_request_metrics"] = dict(response_request_metrics)
         if metadata:
             payload["vllm_omni"] = metadata
 
@@ -1168,13 +1244,8 @@ class ModelChannel:
     # ------------------------------------------------------------------ #
 
     def silence_unit_payload(self) -> dict[str, object]:
-        samples = int(self._ctx.plugin.silence_continuation_samples)
-        audio = (
-            self._SILENCE_UNIT_PAYLOAD_AUDIO
-            if samples == 16000
-            else base64.b64encode(bytes(samples * 4)).decode("ascii")
-        )
-        return {"type": "audio", "audio": audio, "format": "pcm_f32le", "sample_rate_hz": 16000}
+        """One silence unit in the model's own format: the plugin defines it (rate and length)."""
+        return dict(self._ctx.plugin.silence_unit_payload())
 
     def response_continuations_remaining(self, response_id: str) -> bool:
         model_state = self._ctx.model_state
@@ -1198,7 +1269,7 @@ class ModelChannel:
         response_id = session.active_response_id
         response_epoch = session.epoch
         response_turn_id = model_turn_id if model_turn_id is not None else session.active_response_turn_id
-        if expected_epoch is not None and response_epoch != expected_epoch:
+        if self._ctx.run.closing or (expected_epoch is not None and response_epoch != expected_epoch):
             return
         model_state.clear_continuation()
         payload: dict[str, object] = {
@@ -1211,6 +1282,8 @@ class ModelChannel:
         if response_id is not None:
             payload["response_id"] = response_id
         self._out.emit(payload)
+        if self._ctx.run.closing:
+            return
         if response_id is None:
             if session.epoch == response_epoch and response_turn_id is not None:
                 session.complete_model_turn(response_turn_id)
@@ -1242,7 +1315,8 @@ class ModelChannel:
     ) -> bool:
         session = self._ctx.session
         stale_common_owner = (
-            session.state == DuplexSessionState.CLOSED
+            self._ctx.run.closing
+            or session.state == DuplexSessionState.CLOSED
             or session.active_request_id != request_id
             or (expected_epoch is not None and session.epoch != expected_epoch)
         )
@@ -1337,6 +1411,6 @@ class ModelChannel:
         except Exception as exc:
             logger.exception("Failed to schedule duplex native response continuation: %s", exc)
             scheduled = False
-        if scheduled:
+        if scheduled and not self._ctx.run.closing:
             model_state.continuation_owner_id = owner_id
             model_state.continuation_units = count + 1
