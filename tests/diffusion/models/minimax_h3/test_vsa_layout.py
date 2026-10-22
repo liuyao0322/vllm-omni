@@ -219,14 +219,92 @@ def test_h3_forward_restores_rows_the_packed_padding_excludes(monkeypatch):
 
 
 def test_h3_geometry_keeps_prefix_segments_pure_and_tiles_video_3d():
-    partition, sizes, non_pad, untile, prefix_blocks, video_blocks = _get_h3_tile_metadata(
+    gather, sizes, padding, untile, prefix_blocks, video_blocks = _get_h3_tile_metadata(
         (5, 70, 9), (5, 6, 6), torch.device("cpu")
     )
     assert sizes[:4].tolist() == [5, 64, 6, 9]
     assert prefix_blocks == 4
     assert video_blocks == 8
     assert int(sizes.sum()) == 5 + 70 + 9 + 5 * 6 * 6
-    assert partition.numel() == non_pad.numel() == untile.numel() == int(sizes.sum())
+    assert gather.numel() == sizes.numel() * 64
+    assert gather.numel() - padding.numel() == untile.numel() == int(sizes.sum())
+    assert torch.equal(gather[untile], torch.arange(int(sizes.sum())))
+
+
+@pytest.mark.parametrize("tile_size", [64, 128])
+@pytest.mark.parametrize("ragged", [False, True])
+@pytest.mark.parametrize("with_gate", [False, True])
+def test_h3_direct_gather_matches_legacy_layout_and_compression(monkeypatch, tile_size, ragged, with_gate):
+    from vllm_omni.diffusion.attention.ops.block_sparse import mean_pool_tiles
+
+    prefix = (5, 70, 9) if ragged else (128,)
+    grid = (5, 6, 9) if ragged else (4, 4, 8)
+    metadata = _h3_metadata(prefix, grid)
+    if tile_size == 128:
+        metadata.extra.update(vsa_h3_tile_size=128, vsa_h3_ref_policy="p2_multi_region", vsa_h3_sparsity=0.9)
+        get_metadata = _get_h3_multiregion_tile_metadata(prefix, ((sum(prefix), grid),), torch.device("cpu"))
+    else:
+        get_metadata = _get_h3_tile_metadata(prefix, grid, torch.device("cpu"))
+    gather, sizes, _, untile, *_ = get_metadata
+    valid = (torch.arange(tile_size)[None] < sizes[:, None]).flatten()
+    non_pad = valid.nonzero().flatten()
+    partition = gather[valid]
+    seq_len = sum(prefix) + math.prod(grid)
+    torch.manual_seed(41)
+    # Strided batch, sequence and head dimensions, as in sliced packed inputs.
+    q, k, v, gate = [torch.randn(4, seq_len * 2, 4, 8, dtype=torch.bfloat16)[::2, ::2, ::2] for _ in range(4)]
+
+    def legacy_tile(tensor):
+        tiled = torch.zeros(tensor.shape[0], sizes.numel() * tile_size, *tensor.shape[2:], dtype=tensor.dtype)
+        tiled[:, non_pad] = tensor[:, partition]
+        return tiled
+
+    expected_q, expected_k, expected_v = [legacy_tile(tensor) for tensor in (q, k, v)]
+
+    def kernel(actual_q, actual_k, actual_v, *args, **kwargs):
+        for actual, expected in zip((actual_q, actual_k, actual_v), (expected_q, expected_k, expected_v), strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            assert actual.is_contiguous()
+        return expected_v
+
+    monkeypatch.setattr("vllm_omni.diffusion.models.minimax_h3.attention.fastvideo_h3.block_sparse_attn_bshd", kernel)
+    impl = _h3_impl()
+    expected = expected_v
+    if with_gate:
+        # The gate may cover the outer packed padding beyond the valid rows.
+        metadata.extra["gate_compress"] = torch.nn.functional.pad(gate, (0, 0, 0, 0, 0, 7)) if ragged else gate
+        pooled_q, pooled_k, pooled_v = [
+            mean_pool_tiles(t, sizes, tile_size) for t in (expected_q, expected_k, expected_v)
+        ]
+        scores = torch.matmul(pooled_q, pooled_k.transpose(-2, -1)) * impl.softmax_scale
+        compressed = torch.matmul(torch.softmax(scores, dim=-1), pooled_v).permute(0, 2, 1, 3).to(v.dtype)
+        expected = (
+            expected_v.view(2, -1, tile_size, 2, 8)
+            + compressed.unsqueeze(2) * legacy_tile(gate).view(2, -1, tile_size, 2, 8)
+        ).view_as(expected_v)
+    expected = expected[:, untile].contiguous()
+    actual = impl._forward_h3(q, k, v, metadata, provider="fastvideo")
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.is_contiguous()
+
+
+@pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), -float("inf")])
+def test_h3_direct_gather_clears_nonfinite_padding(monkeypatch, nonfinite):
+    metadata = _h3_metadata((5,), (2, 4, 4))
+    query = torch.ones(1, 37, 2, 8, dtype=torch.bfloat16)
+    query[:, 0] = nonfinite
+
+    def kernel(q, k, v, *args, **kwargs):
+        _, sizes, _, _, *_ = _get_h3_tile_metadata((5,), (2, 4, 4), torch.device("cpu"))
+        padding = (torch.arange(64)[None] >= sizes[:, None]).flatten()
+        for tiled in (q, k, v):
+            assert torch.count_nonzero(tiled[:, padding]) == 0
+            torch.testing.assert_close(tiled[:, 0], query[:, 0], rtol=0, atol=0, equal_nan=True)
+        return v
+
+    monkeypatch.setattr("vllm_omni.diffusion.models.minimax_h3.attention.fastvideo_h3.block_sparse_attn_bshd", kernel)
+    actual = _h3_impl()._forward_h3(query, query, query, metadata, provider="fastvideo")
+    torch.testing.assert_close(actual, query, rtol=0, atol=0, equal_nan=True)
 
 
 @pytest.mark.parametrize("fallback_on_error", [False, True])
@@ -283,14 +361,14 @@ def test_h3_without_layout_delegates_to_shared_backend(monkeypatch):
 def test_omni_multiregion_geometry_preserves_interleaved_reference_order():
     prefix = (5, 512, 3, 7, 128, 9)
     regions = ((5, (8, 4, 16)), (527, (4, 4, 8)), (664, (4, 4, 24)))
-    partition, sizes, non_pad, untile, dense, spans = _get_h3_multiregion_tile_metadata(
+    gather, sizes, padding, untile, dense, spans = _get_h3_multiregion_tile_metadata(
         prefix, regions, torch.device("cpu")
     )
     assert sizes[:dense].tolist() == [5, 3, 7, 9]
     assert spans == ((4, 8), (8, 9), (9, 12))
     original = torch.arange(1048)
-    tiled = torch.full((sizes.numel() * 128,), -1)
-    tiled[non_pad] = original[partition]
+    tiled = original.index_select(0, gather)
+    tiled.index_fill_(0, padding, -1)
     assert torch.equal(tiled[untile], original)
 
 
@@ -320,15 +398,13 @@ def test_omni_production_branch_preserves_reference_pooling_boundaries(reference
     prefix = branch.static_kwargs["packed_seq_params"]["vsa_prefix_segments"]
     layout = branch.static_kwargs["video_token_layout"]
     regions = tuple((span.start, span.latent_grid) for span in layout.video_spans)
-    partition, sizes, non_pad, untile, dense, _ = _get_h3_multiregion_tile_metadata(
-        prefix, regions, torch.device("cpu")
-    )
+    gather, sizes, padding, untile, dense, _ = _get_h3_multiregion_tile_metadata(prefix, regions, torch.device("cpu"))
     # Text, each reference and target audio must pool independently, even
     # when adjacent segments have the same modality and fit in one tile.
     expected_sizes = [5, *([64] * (len(reference_kinds) + 1)), 128]
     rows = torch.repeat_interleave(torch.arange(len(expected_sizes), dtype=torch.float32), torch.tensor(expected_sizes))
-    tiled = torch.zeros(sizes.numel() * 128)
-    tiled[non_pad] = rows[partition]
+    tiled = rows.index_select(0, gather)
+    tiled.index_fill_(0, padding, 0)
     pooled = mean_pool_tiles(tiled.view(1, -1, 1, 1), sizes, 128).flatten()
     assert sizes.tolist() == expected_sizes
     assert dense == len(expected_sizes) - 1
