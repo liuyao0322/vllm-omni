@@ -302,7 +302,7 @@ def residual_gate_add(
                 "Disabling fused residual-gate add on %s/%s after a runtime failure: %s",
                 residual.device,
                 residual.dtype,
-                exc,
+                str(exc),
             )
     return residual + gate * update
 

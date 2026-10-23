@@ -1,14 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import gc
+import weakref
+
 import pytest
 import torch
+from vllm.logger import _print_warning_once
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 
+from tests.helpers.mark import hardware_marks
+
 pytestmark = [
     pytest.mark.core_model,
-    pytest.mark.cuda,
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
     pytest.mark.diffusion,
     pytest.mark.skipif(not current_platform.is_cuda(), reason="NVIDIA CUDA platform required"),
 ]
@@ -19,8 +25,10 @@ def _clear_runtime_failure_cache():
     import vllm_omni.diffusion.layers.residual_gate as residual_gate
 
     residual_gate._FAILED_RUNTIME_KEYS.clear()
+    _print_warning_once.cache_clear()
     yield
     residual_gate._FAILED_RUNTIME_KEYS.clear()
+    _print_warning_once.cache_clear()
 
 
 def _make_residual(shape, layout, dtype, *, storage_offset=0):
@@ -229,17 +237,20 @@ def test_residual_gate_add_dispatches_supported_inputs(monkeypatch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_residual_gate_add_caches_runtime_failure(monkeypatch, dtype):
+def test_residual_gate_add_caches_runtime_failure(monkeypatch, caplog, dtype):
     import vllm_omni.diffusion.layers.residual_gate as residual_gate
 
     residual = torch.randn(2, 19, 32, device="cuda", dtype=dtype)
     update = torch.randn_like(residual)
     gate = torch.randn(2, 1, 32, device="cuda", dtype=dtype)
     launch_calls = 0
+    tensor_refs = []
 
     def failing_launch(residual, update, gate):
         nonlocal launch_calls
         launch_calls += 1
+        temporary = torch.empty_like(residual)
+        tensor_refs.append(weakref.ref(temporary))
         raise RuntimeError("synthetic Triton launch failure")
 
     monkeypatch.setattr(residual_gate, "_launch_fused_residual_gate_add", failing_launch)
@@ -252,6 +263,14 @@ def test_residual_gate_add_caches_runtime_failure(monkeypatch, dtype):
     assert (residual.device.index, residual.dtype) in residual_gate._FAILED_RUNTIME_KEYS
     assert torch.equal(first, expected)
     assert torch.equal(second, expected)
+
+    assert _print_warning_once.cache_info().currsize == 1
+    tensor_refs.extend(weakref.ref(value) for value in (residual, update, gate, expected, first, second))
+    # Pytest's log capture is a separate owner; keep the real warning cache live.
+    caplog.clear()
+    del residual, update, gate, expected, first, second
+    gc.collect()
+    assert all(ref() is None for ref in tensor_refs)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
