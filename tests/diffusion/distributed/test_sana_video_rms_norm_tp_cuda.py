@@ -18,6 +18,7 @@ from vllm.utils.network_utils import get_open_port
 
 import vllm_omni.diffusion.layers.sana_rms_norm as sana_rms
 import vllm_omni.diffusion.models.sana_video.transformer_sana_video as sana_transformer
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
     init_distributed_environment,
@@ -163,8 +164,7 @@ def _require_two_bf16_cuda_devices() -> None:
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
-@pytest.mark.cuda
-@pytest.mark.cards_2
+@hardware_test(res={"cuda": "L4"}, num_cards=2)
 def test_sana_video_distributed_rms_norm_tp2_keeps_global_reduction() -> None:
     _require_two_bf16_cuda_devices()
     init_method = f"tcp://127.0.0.1:{get_open_port()}"

@@ -14,10 +14,11 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 
 import vllm_omni.diffusion.layers.sana_rms_norm as sana_rms
+from tests.helpers.mark import hardware_marks
 
 pytestmark = [
     pytest.mark.core_model,
-    pytest.mark.cuda,
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
     pytest.mark.diffusion,
     pytest.mark.skipif(not current_platform.is_cuda(), reason="NVIDIA CUDA required"),
 ]

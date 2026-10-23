@@ -22,11 +22,12 @@ from vllm.triton_utils import HAS_TRITON
 
 import vllm_omni.diffusion.layers.sana_rms_norm as sana_rms
 import vllm_omni.diffusion.models.sana_video.transformer_sana_video as sana_transformer
+from tests.helpers.mark import hardware_marks
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [
     pytest.mark.core_model,
-    pytest.mark.cuda,
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
     pytest.mark.diffusion,
     pytest.mark.skipif(not current_platform.is_cuda(), reason="NVIDIA CUDA required"),
 ]
