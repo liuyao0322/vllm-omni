@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+import gc
+import weakref
 from collections.abc import Iterator
 
 import pytest
 import torch
+from vllm.logger import _print_warning_once
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 
@@ -24,9 +27,15 @@ pytestmark = [
 def _reset_fusion_state() -> Iterator[None]:
     sana_rms._VERIFIED_SIGNATURES.clear()
     sana_rms._DISABLED_SIGNATURES.clear()
+    sana_rms._VERIFIED_SUM_SIGNATURES.clear()
+    sana_rms._DISABLED_SUM_SIGNATURES.clear()
+    _print_warning_once.cache_clear()
     yield
     sana_rms._VERIFIED_SIGNATURES.clear()
     sana_rms._DISABLED_SIGNATURES.clear()
+    sana_rms._VERIFIED_SUM_SIGNATURES.clear()
+    sana_rms._DISABLED_SUM_SIGNATURES.clear()
+    _print_warning_once.cache_clear()
 
 
 def _reference(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -135,26 +144,53 @@ def test_mismatch_disables_signature_and_returns_eager(monkeypatch: pytest.Monke
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
-def test_launch_failure_disables_signature_and_returns_eager(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("sum_reduction", [False, True])
+def test_launch_failure_disables_signature_and_returns_eager(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    sum_reduction: bool,
+) -> None:
     hidden_states = torch.randn((1, 1024, 2240), device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(2240, device="cuda", dtype=torch.bfloat16)
-    expected = _reference(hidden_states, weight, 1e-5)
+    if sum_reduction:
+        variance = hidden_states.float().pow(2).sum(-1, keepdim=True) / hidden_states.shape[-1]
+        normalized = hidden_states.float() * torch.rsqrt(variance + 1e-5)
+        expected = normalized.to(weight.dtype) * weight
+    else:
+        expected = _reference(hidden_states, weight, 1e-5)
     calls = 0
+    tensor_refs = []
 
-    def fail(*_args) -> torch.Tensor:
+    def fail(hidden_states, weight, eps) -> torch.Tensor:
         nonlocal calls
         calls += 1
+        temporary = torch.empty_like(hidden_states)
+        tensor_refs.append(weakref.ref(temporary))
         raise RuntimeError("synthetic launch failure")
 
-    monkeypatch.setattr(sana_rms, "_launch_exact_sana_rms_norm", fail)
+    launch_name = "_launch_exact_sana_rms_norm_sum" if sum_reduction else "_launch_exact_sana_rms_norm"
+    wrapper = sana_rms.exact_sana_rms_norm_sum if sum_reduction else sana_rms.exact_sana_rms_norm
+    disabled = sana_rms._DISABLED_SUM_SIGNATURES if sum_reduction else sana_rms._DISABLED_SIGNATURES
+    other_disabled = sana_rms._DISABLED_SIGNATURES if sum_reduction else sana_rms._DISABLED_SUM_SIGNATURES
+    monkeypatch.setattr(sana_rms, launch_name, fail)
     with torch.no_grad():
-        first = sana_rms.exact_sana_rms_norm(hidden_states, weight, 1e-5)
-        second = sana_rms.exact_sana_rms_norm(hidden_states, weight, 1e-5)
+        first = wrapper(hidden_states, weight, 1e-5)
+        second = wrapper(hidden_states, weight, 1e-5)
 
     assert _raw_equal(first, expected)
     assert _raw_equal(second, expected)
     assert calls == 1
-    assert sana_rms._signature(hidden_states) in sana_rms._DISABLED_SIGNATURES
+    assert sana_rms._signature(hidden_states) in disabled
+    assert not other_disabled
+    assert _print_warning_once.cache_info().currsize == 1
+    tensor_refs.extend(weakref.ref(value) for value in (hidden_states, weight, expected, first, second))
+    # Pytest's log capture is a separate owner; keep the real warning cache live.
+    caplog.clear()
+    del hidden_states, weight, expected, first, second
+    if sum_reduction:
+        del variance, normalized
+    gc.collect()
+    assert all(ref() is None for ref in tensor_refs)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

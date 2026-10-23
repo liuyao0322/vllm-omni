@@ -330,7 +330,7 @@ def _verified_sana_rms_norm(
             "SANA exact RMSNorm (%s) failed for %s; disabling this signature: %s",
             reduction,
             signature,
-            error,
+            str(error),
         )
         return eager(hidden_states, weight, eps)
 
