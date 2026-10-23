@@ -5,11 +5,13 @@ import pytest
 import torch
 from vllm.triton_utils import HAS_TRITON
 
+from tests.helpers.mark import hardware_marks
+
 NVIDIA_CUDA_AVAILABLE = torch.cuda.is_available() and torch.version.hip is None
 
 pytestmark = [
     pytest.mark.core_model,
-    pytest.mark.cuda,
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
     pytest.mark.diffusion,
     pytest.mark.skipif(not NVIDIA_CUDA_AVAILABLE, reason="NVIDIA CUDA required"),
     pytest.mark.skipif(not HAS_TRITON, reason="Triton required"),
