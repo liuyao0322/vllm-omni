@@ -134,9 +134,32 @@ the returned `id` to query `/v1/videos/{id}` and, once completed, download
 not prohibit shorter legal clips. The service preserves the source image's
 geometry for the pipeline's own resize and center crop.
 
-## Validation scope
+## Current small-shape verification
 
-Validated on one NVIDIA H20-3e with BF16 weights and the release FP32
+Revalidated on 2026-10-23 against production source
+`aede5ecd638001fd3653d0c4c38cd3ba9bae64ad`; the follow-up adds tests and
+documentation without changing the production implementation.
+[The checked-in receipt](../../tests/e2e/accuracy/sana_video2/receipt.md)
+records every step's hash, component revisions, MP4 hashes and request IDs.
+
+| Check | Result |
+| --- | --- |
+| CPU registry/loading and video-serving regressions | 189 passed |
+| Native strict loading through offline dispatcher | 795 keys, 4,466,980,960 parameters |
+| T2V and TI2V against pinned upstream | 50/50 step latents and decoded tensors byte-identical for each task |
+| Native offline T2V and TI2V | Nonempty exported MP4s, each decodes to 9x64x96x3 |
+| HTTP T2V and TI2V | Completed requests and downloaded MP4s, each decodes to 9x64x96x3 |
+
+These runs used one H20-3e per job, vLLM 0.31.0, PyTorch 2.13.0+cu130,
+Diffusers 0.40.0, Transformers 5.14.1 and the pinned release components below.
+The workload was 64x96, 9 frames, 50 steps, CFG 8, seed 42, motion score 10
+and flow shift 12. No full-size performance or quality claim follows from it.
+These are local Slurm results; no official Buildkite pass is claimed.
+
+## Historical validation scope
+
+The following observations predate the framework rebase and are retained as
+historical evidence, not matching-head verification. Recorded on one NVIDIA H20-3e with BF16 weights and the release FP32
 self-attention path:
 
 | Check | Scope | Result |
@@ -153,3 +176,128 @@ output tensor, but excluding MP4 encoding. These are single-run capacity and
 correctness observations, not a repeated latency benchmark or a speedup claim.
 Full-dimension output was not compared numerically with an upstream full video;
 the exact real-weight comparison above used the stated small dimensions.
+
+## Reproduce the small-shape review checks
+
+The opt-in runner at `tests/e2e/accuracy/sana_video2/validate.py` exercises the
+real native checkpoint, independent upstream transformer/samplers, offline
+`Omni.generate`, and the HTTP video endpoint. It is not an enabled Buildkite
+job. Use a dedicated environment with the project's dependencies, one NVIDIA
+GPU with BF16 support and enough memory for both transformers during alignment
+(the recorded runs use one H20-3e), and FFmpeg through `imageio-ffmpeg`.
+
+Prepare pinned local components:
+
+```bash
+export SANA2_ASSETS=/path/to/sana2-assets
+export SANA2_OUTPUT=/path/to/sana2-results
+export SANA2_REFERENCE=/path/to/Sana-reference
+hf download Efficient-Large-Model/SANA-Video_2.0_5B_720p \
+  --revision f2d95fa06400f186fd1b077d12c69c8ac58aba48 \
+  --include config.yaml 'checkpoints/*.pth' --local-dir "$SANA2_ASSETS/model"
+hf download Efficient-Large-Model/LTX-2.3-Diffusers \
+  --revision 362acdf779d42e785fb26910c32254e9458e78c2 \
+  --include 'vae/*' --local-dir "$SANA2_ASSETS/vae"
+hf download Efficient-Large-Model/gemma-2-2b-it \
+  --revision 569d9809d0c8b6722d4d31b5a77a2ec7a400650a \
+  --include config.json generation_config.json 'model-*' model.safetensors.index.json \
+  special_tokens_map.json 'tokenizer*' --local-dir "$SANA2_ASSETS/text"
+git clone --filter=blob:none https://github.com/NVlabs/Sana.git "$SANA2_REFERENCE"
+git -C "$SANA2_REFERENCE" checkout e93c883e10730ee5a4a6edf1cbcf501dc4ef753b
+```
+
+Create component receipts and verify every downloaded LFS weight against its
+pinned Hub SHA256 before allocating a GPU:
+
+```python
+import hashlib
+import json
+import os
+from pathlib import Path
+
+import requests
+
+root = Path(os.environ["SANA2_ASSETS"])
+specs = {
+    "model": ("SANA-Video_2.0_5B_720p", "f2d95fa06400f186fd1b077d12c69c8ac58aba48"),
+    "vae": ("LTX-2.3-Diffusers", "362acdf779d42e785fb26910c32254e9458e78c2"),
+    "text": ("gemma-2-2b-it", "569d9809d0c8b6722d4d31b5a77a2ec7a400650a"),
+}
+for name, (model, revision) in specs.items():
+    repo = f"Efficient-Large-Model/{model}"
+    response = requests.get(
+        f"https://huggingface.co/api/models/{repo}/revision/{revision}?blobs=true",
+        timeout=60,
+    )
+    response.raise_for_status()
+    manifest = response.json()
+    assert manifest["sha"] == revision
+    files = []
+    for item in manifest["siblings"]:
+        path = root / name / item["rfilename"]
+        if not path.is_file():
+            continue
+        assert path.stat().st_size == item["size"]
+        if item.get("lfs"):
+            with path.open("rb") as stream:
+                actual = hashlib.file_digest(stream, "sha256").hexdigest()
+            assert actual == item["lfs"]["sha256"], str(path)
+        files.append(item)
+    (root / name / "validated_revision.json").write_text(
+        json.dumps({"repo": repo, "revision": revision, "files": files}, indent=2)
+    )
+```
+
+The reference import helper bypasses upstream package initializers that eagerly
+import unrelated training/model packages. Its only replacement module supplies
+a real `mmcv.Registry` for model registration. Transformer, attention, norms,
+DPM-Solver and LTX Euler source files are imported unchanged from the pinned
+checkout. Text conditioning follows the upstream inference script using the
+release YAML instruction and the shared pinned Gemma decoder; the independently
+loaded reference VAE is Diffusers'
+`AutoencoderKLLTX2Video`. Both VAEs use the upstream decoder-config adaptation
+that reverses `decoder_upsample_type` into `upsample_type`.
+
+Install reference-only dependencies in that dedicated environment:
+
+```bash
+python -m pip install --no-deps 'setuptools==80.10.2' 'timm==1.0.27' termcolor addict yapf pytz
+python -m pip install --no-deps --no-build-isolation 'mmcv==1.7.2'
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+export OMP_NUM_THREADS=8 DISABLE_XFORMERS=1 DPM_TQDM=True HF_HUB_OFFLINE=1
+python -m tests.e2e.accuracy.sana_video2.validate alignment \
+  --assets "$SANA2_ASSETS" --reference "$SANA2_REFERENCE" --output "$SANA2_OUTPUT"
+python -m tests.e2e.accuracy.sana_video2.validate offline \
+  --assets "$SANA2_ASSETS" --output "$SANA2_OUTPUT"
+```
+
+Start the actual Omni server, then run the HTTP checks in another terminal
+sharing the output directory:
+
+```bash
+python -m tests.e2e.accuracy.sana_video2.validate serve \
+  --assets "$SANA2_ASSETS" --output "$SANA2_OUTPUT" --url http://127.0.0.1:8091
+python -m tests.e2e.accuracy.sana_video2.validate http \
+  --assets "$SANA2_ASSETS" --output "$SANA2_OUTPUT" --url http://127.0.0.1:8091
+```
+
+Use vLLM 0.31.0 with PyTorch 2.13.0 and the repository-pinned Diffusers 0.40.0
+and Transformers 5.13–5.14 dependencies. No production source patch or
+runtime compatibility adapter is used.
+
+The runner uses seed 42, 64x96, 9 frames, 50 steps, CFG 8, motion score 10,
+flow shift 12 and an explicit negative prompt. It creates a deterministic
+80x120 RGB reference image. Alignment saves both 50-step trajectories and raw
+decoded tensors in `alignment-{t2v,ti2v}.npz`, asserts exact equality, and writes
+per-step maximum/mean errors to `alignment-receipt.json`. Offline and HTTP
+receipts record nonempty MP4 byte sizes, hashes and the decoded 9x64x96x3 shape;
+offline also saves the raw NumPy arrays. These small clips check execution and
+numerical agreement, not release-resolution quality or performance.
+
+Focused CPU registry/loading tests (no model downloads):
+
+```bash
+python -m pytest -q tests/diffusion/models/sana_video2/test_loading.py
+python -m pytest -q tests/diffusion/models/sana_video2/test_loading.py \
+  -m 'core_model and cpu' --run-level core_model
+```

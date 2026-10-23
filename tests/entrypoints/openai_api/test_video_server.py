@@ -286,7 +286,7 @@ def test_resolve_diffusion_od_config_prefers_getter_over_attribute():
 class BlockingVideoHandler:
     supports_mixed_reference_inputs = False
     supports_latent_mask_editing = False
-    supported_control_upload_types = frozenset()
+    supported_control_upload_types: frozenset[str] = frozenset()
 
     def __init__(self):
         self.model_name = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
@@ -977,6 +977,7 @@ def test_magi2_serving_applies_native_defaults_and_rejects_explicit_frame_mismat
 
     asyncio.run(handler._run_and_extract(VideoGenerationRequest(prompt="A fox walks through snow"), "defaults"))
 
+    assert engine.captured_sampling_params_list is not None
     sampling = engine.captured_sampling_params_list[0]
     assert (sampling.width, sampling.height) == (896, 512)
     assert sampling.num_frames == 125
@@ -1021,6 +1022,7 @@ def test_sana_video2_serving_preserves_variable_frame_count(num_frames):
     )
     request = VideoGenerationRequest(prompt="A red boat", num_frames=num_frames)
     asyncio.run(handler._run_and_extract(request, "sana2-frames"))
+    assert engine.captured_sampling_params_list is not None
     sampling = engine.captured_sampling_params_list[0]
     assert sampling.num_frames == (193 if num_frames is None else num_frames)
     assert (sampling.height, sampling.width) == (736, 1280)
@@ -1040,6 +1042,7 @@ def test_kandinsky6_serving_applies_defaults_but_allows_explicit_frame_count():
     )
 
     asyncio.run(handler._run_and_extract(VideoGenerationRequest(prompt="A dog runs on a beach"), "defaults"))
+    assert engine.captured_sampling_params_list is not None
     sampling = engine.captured_sampling_params_list[0]
     assert (sampling.width, sampling.height) == (864, 480)
     assert sampling.num_frames == 125
@@ -1054,6 +1057,7 @@ def test_kandinsky6_serving_applies_defaults_but_allows_explicit_frame_count():
             "explicit",
         )
     )
+    assert engine.captured_sampling_params_list is not None
     sampling = engine.captured_sampling_params_list[-1]
     assert (sampling.width, sampling.height) == (512, 320)
     assert sampling.num_frames == 25
