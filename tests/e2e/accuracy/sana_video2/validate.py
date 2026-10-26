@@ -6,7 +6,6 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
-import os
 import platform
 import subprocess
 import sys
@@ -377,8 +376,6 @@ def main():
     subprocess.run(["git", "diff", "--exit-code", "HEAD", "--", "vllm_omni"], check=True)
     receipt = dict(
         source_sha=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-        hostname=platform.node(),
-        slurm_job=os.environ.get("SLURM_JOB_ID"),
         python=platform.python_version(),
         runner_sha256=digest(Path(__file__).read_bytes()),
         packages={

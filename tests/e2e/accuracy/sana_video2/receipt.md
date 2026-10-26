@@ -2,11 +2,11 @@
 
 Executed 2026-10-23 against production source `aede5ecd638001fd3653d0c4c38cd3ba9bae64ad`. The accompanying change adds tests and documentation only; `vllm_omni/` is unchanged.
 
-One NVIDIA H20-3e per job (143771 MiB, driver 580.105.08), node `vllm-sgp-h20-01`. Slurm job 2133 covers alignment and offline; 2134 covers HTTP. Both completed with exit 0. CPU registry/loading tests passed in job 2130; the combined registry/loading and video-serving run in job 2135 passed all 189 tests. No runtime compatibility adapter or production source patch was used.
+One NVIDIA H20-3e per GPU run (143771 MiB, driver 580.105.08). Alignment/offline and HTTP validation both completed with exit 0. All 10 focused CPU registry/loading tests passed; the combined registry/loading and video-serving run passed all 189 tests. No runtime compatibility adapter or production source patch was used.
 
 Python 3.12.15; PyTorch 2.13.0+cu130; vLLM 0.31.0; Triton 3.7.1; Diffusers 0.40.0; Transformers 5.14.1. The installed Omni distribution metadata is stale (`0.1.dev3103+g8c3d3407d`) and emitted a version warning; imports used the source SHA above.
 
-Runner SHA256: `4b12c9899704e1026e580bbc9a1a573931018282def76235b4eb260ec3fbefaa`. Reference: `NVlabs/Sana@e93c883e10730ee5a4a6edf1cbcf501dc4ef753b`. See the recipe for exact setup and invocation commands.
+Measured runner at `37270e02079697b40ce74af62322378748353163`, SHA256: `4b12c9899704e1026e580bbc9a1a573931018282def76235b4eb260ec3fbefaa`. The current runner omits host and scheduler identifiers from generated receipts; this metadata-only change does not alter inference, and the GPU checks were not rerun. Reference: `NVlabs/Sana@e93c883e10730ee5a4a6edf1cbcf501dc4ef753b`. See the recipe for exact setup and invocation commands.
 
 ## Inputs and loading
 
@@ -120,6 +120,6 @@ All four MP4s are nonempty, contain nonconstant decoded pixels, and decode to **
 
 ## Scope
 
-These are local Slurm correctness/contract checks, not official Buildkite results. No full-size run or speedup benchmark was repeated. Historical release-size capacity observations in the recipe remain explicitly historical.
+These are local correctness/contract checks, not official Buildkite results. No full-size run or speedup benchmark was repeated. Historical release-size capacity observations in the recipe remain explicitly historical.
 
 The runner writes `alignment-receipt.json`, `offline-receipt.json`, `http-receipt.json`, the two alignment NPZ files, offline raw NPY files, four MP4s and the input PNG. Re-run the checked-in commands to regenerate these artifacts; this receipt records their measured evidence without committing generated binary videos/trajectories.
